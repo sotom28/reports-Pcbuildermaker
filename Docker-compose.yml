@@ -1,0 +1,70 @@
+services:
+  rabbitmq:
+    image: rabbitmq:3-management
+    restart: unless-stopped
+    ports:
+      - "5672:5672"    # AMQP (lo usan los microservicios)
+      - "15672:15672"  # panel web: http://localhost:15672
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-pcmarket}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-pcmarket}   # definir en .env fuera de desarrollo
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  db:
+    image: mariadb:11
+    restart: unless-stopped
+    environment:
+      MARIADB_DATABASE: db_reports
+      MARIADB_ROOT_PASSWORD: ${DB_PASSWORD:-}
+      MARIADB_ALLOW_EMPTY_ROOT_PASSWORD: "yes"
+    # Sin puerto publicado: en el host ya hay un MariaDB en 3306 (usar ese al correr la app fuera de Docker).
+    volumes:
+      - db_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Requiere el jar: ./mvnw -DskipTests package
+  app:
+    build: .
+    restart: unless-stopped
+    profiles: ["app"]   # docker compose --profile app up -d
+    environment:
+      SPRING_PROFILES_ACTIVE: prod
+      DB_HOST: db
+      DB_PORT: "3306"
+      DB_NAME: db_reports
+      DB_USER: root
+      DB_PASSWORD: ${DB_PASSWORD:-}
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_USER: ${RABBITMQ_USER:-pcmarket}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-pcmarket}
+      INSPECTION_DEADLINE: ${INSPECTION_DEADLINE:-PT72H}
+      REPORTS_DIR: /data/reports
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      MAIL_FROM: ${MAIL_FROM:-no-reply@pcmarketbuilder.local}
+    ports:
+      - "${SERVER_PORT:-8087}:8087"
+    volumes:
+      - reports_pdf:/data/reports
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+
+volumes:
+  rabbitmq_data:
+  db_data:
+  reports_pdf:

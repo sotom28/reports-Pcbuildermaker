@@ -1,0 +1,20 @@
+package com.example.reports_service.repository;
+
+import com.example.reports_service.model.Inspection;
+import com.example.reports_service.model.InspectionStatus;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+import java.util.Collection;
+import java.util.List;
+import java.util.Optional;
+
+public interface InspectionRepository extends JpaRepository<Inspection, String> {
+
+    boolean existsByOrderItemId(String orderItemId);
+
+    Optional<Inspection> findByOrderItemId(String orderItemId);
+
+    List<Inspection> findByStatusInOrderByDueAtAsc(Collection<InspectionStatus> statuses);
+
+    List<Inspection> findByAgentIdOrderByCreatedAtDesc(String agentId);
+}
