@@ -18,4 +18,7 @@ public interface InspectionRepository extends JpaRepository<Inspection, String> 
     List<Inspection> findByStatusInOrderByCreatedAtAsc(Collection<InspectionStatus> statuses);
 
     List<Inspection> findByAgentIdOrderByCreatedAtDesc(String agentId);
+
+    /** Compras del usuario ("Mis compras"). */
+    List<Inspection> findByBuyerIdOrderByCreatedAtDesc(String buyerId);
 }

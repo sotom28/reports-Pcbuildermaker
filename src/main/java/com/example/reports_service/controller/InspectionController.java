@@ -24,7 +24,7 @@ public class InspectionController {
 
     private final InspectionService inspections;
 
-    /** Bandeja del agente: abiertas (las mas urgentes primero) o ?scope=mine. */
+    /** Bandeja del admin: abiertas (las mas antiguas primero), ?scope=mine (las que cerro) o ?scope=buyer (mis compras). */
     @GetMapping
     public List<InspectionResponse> list(
             @RequestHeader(value = AuthContext.USER_ID_HEADER, required = false) String userId,
@@ -34,7 +34,8 @@ public class InspectionController {
         return switch (scope) {
             case "open" -> inspections.listOpen(auth);
             case "mine" -> inspections.listMine(auth);
-            default -> throw new IllegalArgumentException("El parametro 'scope' debe ser 'open' o 'mine'");
+            case "buyer" -> inspections.listAsBuyer(auth);
+            default -> throw new IllegalArgumentException("El parametro 'scope' debe ser 'open', 'mine' o 'buyer'");
         };
     }
 

@@ -191,6 +191,18 @@ class InspectionFlowTest {
     }
 
     @Test
+    void cadaCompradorVeSoloSusCompras() {
+        service.registerPaidOrder(order("6")); // comprador buyer-1
+        service.registerPaidOrder(new OrderPaid("order-7", "buyer-2", "otro@correo.cl", Instant.now(),
+                List.of(new PaidItem("item-7", "pub-7", "seller-1", "SSD 1TB", 60000))));
+
+        var mine = service.listAsBuyer(BUYER);
+        assertTrue(mine.stream().anyMatch(i -> i.orderItemId().equals("item-6")));
+        assertTrue(mine.stream().noneMatch(i -> i.orderItemId().equals("item-7")), "no ve compras ajenas");
+        assertTrue(service.listAsBuyer(new AuthContext("buyer-3", null)).isEmpty());
+    }
+
+    @Test
     void soloElAdminOperaLaBandeja() {
         assertThrows(ForbiddenException.class, () -> service.listOpen(BUYER));
     }

@@ -73,6 +73,13 @@ public class InspectionService {
                 .stream().map(InspectionResponse::from).toList();
     }
 
+    /** Las inspecciones de las piezas que compro el usuario (no requiere ser admin). */
+    @Transactional(readOnly = true)
+    public List<InspectionResponse> listAsBuyer(AuthContext auth) {
+        return inspections.findByBuyerIdOrderByCreatedAtDesc(auth.userId())
+                .stream().map(InspectionResponse::from).toList();
+    }
+
     @Transactional(readOnly = true)
     public InspectionResponse get(AuthContext auth, String id) {
         Inspection i = load(id);
