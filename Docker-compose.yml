@@ -16,6 +16,14 @@ services:
       timeout: 5s
       retries: 10
 
+  # SMTP falso para desarrollo: recibe los correos y los muestra en http://localhost:8025 (no envia nada real).
+  mailpit:
+    image: axllent/mailpit
+    restart: unless-stopped
+    ports:
+      - "1025:1025"    # SMTP
+      - "8025:8025"    # panel web
+
   db:
     image: mariadb:11
     restart: unless-stopped
@@ -32,7 +40,7 @@ services:
       timeout: 5s
       retries: 10
 
-  # Requiere el jar: ./mvnw -DskipTests package
+  # Se compila dentro de la imagen (Dockerfile multi-stage)
   app:
     build: .
     restart: unless-stopped
@@ -47,12 +55,13 @@ services:
       RABBITMQ_HOST: rabbitmq
       RABBITMQ_USER: ${RABBITMQ_USER:-pcmarket}
       RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-pcmarket}
-      INSPECTION_DEADLINE: ${INSPECTION_DEADLINE:-PT72H}
       REPORTS_DIR: /data/reports
       SMTP_HOST: ${SMTP_HOST:-}
       SMTP_PORT: ${SMTP_PORT:-587}
       SMTP_USER: ${SMTP_USER:-}
       SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_AUTH: ${SMTP_AUTH:-true}
+      SMTP_STARTTLS: ${SMTP_STARTTLS:-true}
       MAIL_FROM: ${MAIL_FROM:-no-reply@pcmarketbuilder.local}
     ports:
       - "${SERVER_PORT:-8087}:8087"

@@ -1,9 +1,11 @@
 package com.example.reports_service.service;
 
+import com.example.reports_service.config.RabbitConfig;
 import com.example.reports_service.exception.ApiExceptions.NotFoundException;
 import com.example.reports_service.mail.MailService;
 import com.example.reports_service.messaging.Events.InspectionCompleted;
-import com.example.reports_service.messaging.Events.InspectionDelayed;
+import com.example.reports_service.messaging.Events.ReportGenerated;
+import com.example.reports_service.messaging.OutboundMessage;
 import com.example.reports_service.model.InspectionStatus;
 import com.example.reports_service.model.Report;
 import com.example.reports_service.pdf.PdfReportGenerator;
@@ -11,6 +13,7 @@ import com.example.reports_service.repository.ReportRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.core.io.FileSystemResource;
 import org.springframework.core.io.Resource;
 import org.springframework.stereotype.Service;
@@ -22,7 +25,10 @@ import java.nio.file.Path;
 import java.time.Instant;
 import java.util.List;
 
-/** Genera el PDF, lo guarda (disco local en el MVP), registra la metadata y lo envia por correo. */
+/**
+ * Las tres etapas posteriores a la revision, cada una en su propia cola:
+ * confirmacion por correo, generacion del PDF, y envio del PDF por correo.
+ */
 @Slf4j
 @Service
 @RequiredArgsConstructor
@@ -31,43 +37,90 @@ public class ReportService {
     private final PdfReportGenerator pdf;
     private final ReportRepository reports;
     private final MailService mail;
+    private final InspectionService inspections;
+    private final ApplicationEventPublisher events;
 
     @Value("${app.reports.dir:reports-pdf}")
     private String dir;
 
-    /** Idempotente por item+tipo: si RabbitMQ reentrega el mensaje no se duplica el informe ni el correo. */
-    public void onCompleted(InspectionCompleted e) {
-        if (alreadyGenerated(e.orderItemId(), Report.Type.TECHNICAL_REPORT)) {
+    /** Etapa 1 (cola mail.confirmation): "todo salio bien / no aprobo". Idempotente por inspeccion. */
+    public void sendConfirmation(InspectionCompleted e) {
+        if (inspections.isConfirmationEmailed(e.inspectionId())) {
+            log.info("Confirmacion de la inspeccion {} ya enviada, se ignora la reentrega", e.inspectionId());
             return;
         }
-        byte[] bytes = pdf.technicalReport(e);
-        Report report = store(e.orderItemId(), Report.Type.TECHNICAL_REPORT, bytes);
         boolean approved = e.inspectionStatus() == InspectionStatus.PASSED;
-        boolean sent = mail.sendPdf(List.of(e.buyerEmail(), e.sellerEmail()),
-                "Informe tecnico: " + (approved ? "producto aprobado" : "producto rechazado"),
-                "Adjuntamos el informe de la revision tecnica de \"" + e.description() + "\" (orden " + e.orderId()
-                        + ").\nResultado: " + (approved ? "APROBADO, se enviara al comprador." : "RECHAZADO, no se enviara.")
-                        + "\n\nPC Market Builder",
-                "informe-tecnico-" + e.orderItemId() + ".pdf", bytes);
-        markEmailed(report, sent);
+        String body = approved
+                ? "Hola,\n\nLa revisión técnica de \"" + e.description() + "\" (orden " + e.orderId() + ") terminó "
+                  + "correctamente. Tu pieza pasó todas las pruebas del taller y será enviada.\n\n"
+                  + "Mantenimiento realizado: " + e.maintenanceDone() + "\n\n"
+                  + "En unos instantes recibirás otro correo con el informe técnico en PDF.\n\nPC Market Builder"
+                : "Hola,\n\nLa revisión técnica de \"" + e.description() + "\" (orden " + e.orderId() + ") terminó "
+                  + "y la pieza no aprobó las pruebas del taller, por lo que no será enviada.\n\n"
+                  + "Detalle: " + e.maintenanceDone() + "\n\n"
+                  + "En unos instantes recibirás otro correo con el informe técnico en PDF.\n\nPC Market Builder";
+        boolean sent = mail.send(List.of(nullToEmpty(e.buyerEmail())),
+                approved ? "Tu pieza pasó la revisión técnica y será enviada" : "Tu pieza no aprobó la revisión técnica",
+                body);
+        if (sent) {
+            inspections.markConfirmationEmailed(e.inspectionId());
+        }
     }
 
-    public void onDelayed(InspectionDelayed e) {
-        if (alreadyGenerated(e.orderItemId(), Report.Type.DELAY_NOTICE)) {
+    /**
+     * Etapa 2 (cola report.generate): crea el PDF, lo guarda y avisa que existe (report.generated).
+     * Idempotente por item: si el PDF ya existia se vuelve a anunciar solo si nadie lo envio aun, asi una
+     * publicacion perdida se recupera con la reentrega.
+     */
+    public void generate(InspectionCompleted e) {
+        Report existing = reports.findByOrderItemIdOrderByGeneratedAtDesc(e.orderItemId()).stream()
+                .filter(r -> r.getType() == Report.Type.TECHNICAL_REPORT)
+                .findFirst().orElse(null);
+        if (existing != null) {
+            log.info("Informe del item {} ya existe", e.orderItemId());
+            if (existing.getEmailedAt() == null) {
+                announce(existing, e);
+            }
             return;
         }
-        byte[] bytes = pdf.delayNotice(e);
-        Report report = store(e.orderItemId(), Report.Type.DELAY_NOTICE, bytes);
-        boolean sent = mail.sendPdf(List.of(e.buyerEmail(), e.sellerEmail()),
-                "Aviso: la revision tecnica de tu producto esta demorada",
-                "La revision de \"" + e.description() + "\" (orden " + e.orderId() + ") supero el plazo estimado. "
-                        + "Sigue en curso y te enviaremos el informe en cuanto termine. Detalle en el PDF adjunto."
-                        + "\n\nPC Market Builder",
-                "aviso-demora-" + e.orderItemId() + ".pdf", bytes);
-        markEmailed(report, sent);
+        Report report = store(e.orderItemId(), Report.Type.TECHNICAL_REPORT, pdf.technicalReport(e));
+        log.info("Informe {} generado para el item {}", report.getReportId(), e.orderItemId());
+        announce(report, e);
     }
 
-    /** Ultimo informe tecnico del item (el de aviso de demora no cuenta como informe). */
+    /** Etapa 3 (cola mail.report): envia el PDF por correo. Idempotente por informe. */
+    public void mailReport(ReportGenerated e) {
+        Report report = reports.findById(e.reportId())
+                .orElseThrow(() -> new NotFoundException("Informe no encontrado: " + e.reportId()));
+        if (report.getEmailedAt() != null) {
+            log.info("Informe {} ya enviado, se ignora la reentrega", report.getReportId());
+            return;
+        }
+        byte[] bytes;
+        try {
+            bytes = Files.readAllBytes(Path.of(report.getPdfUrl()));
+        } catch (IOException ex) {
+            throw new UncheckedIOException("No se pudo leer el PDF " + report.getPdfUrl(), ex);
+        }
+        boolean approved = e.inspectionStatus() == InspectionStatus.PASSED;
+        boolean sent = mail.sendPdf(List.of(nullToEmpty(e.buyerEmail())),
+                "Informe técnico: " + (approved ? "producto aprobado" : "producto rechazado"),
+                "Hola,\n\nAdjuntamos el informe técnico de la revisión de \"" + e.description() + "\" (orden "
+                        + e.orderId() + ").\nResultado: " + (approved ? "APROBADO, se enviará a tu dirección."
+                        : "RECHAZADO, no se enviará.") + "\n\nPC Market Builder",
+                "informe-tecnico-" + e.orderItemId() + ".pdf", bytes);
+        if (sent) {
+            report.setEmailedAt(Instant.now());
+            reports.save(report);
+        }
+    }
+
+    /** Cuantos informes tiene el item (debe ser 1: la generacion es idempotente). */
+    public long reportCount(String orderItemId) {
+        return reports.findByOrderItemIdOrderByGeneratedAtDesc(orderItemId).size();
+    }
+
+    /** Ultimo informe tecnico del item. */
     public Report latestTechnicalReport(String orderItemId) {
         return reports.findByOrderItemIdOrderByGeneratedAtDesc(orderItemId).stream()
                 .filter(r -> r.getType() == Report.Type.TECHNICAL_REPORT)
@@ -83,13 +136,11 @@ public class ReportService {
         return new FileSystemResource(path);
     }
 
-    private boolean alreadyGenerated(String orderItemId, Report.Type type) {
-        boolean exists = reports.findByOrderItemIdOrderByGeneratedAtDesc(orderItemId).stream()
-                .anyMatch(r -> r.getType() == type);
-        if (exists) {
-            log.info("{} del item {} ya existe, se ignora la reentrega", type, orderItemId);
-        }
-        return exists;
+    private void announce(Report report, InspectionCompleted e) {
+        events.publishEvent(new OutboundMessage(RabbitConfig.EXCHANGE, RabbitConfig.KEY_REPORT_GENERATED,
+                new ReportGenerated(RabbitConfig.KEY_REPORT_GENERATED, Instant.now(), report.getReportId(),
+                        e.inspectionId(), e.orderId(), e.orderItemId(), e.description(), e.buyerEmail(),
+                        e.inspectionStatus())));
     }
 
     private Report store(String orderItemId, Report.Type type, byte[] bytes) {
@@ -103,15 +154,12 @@ public class ReportService {
             r.setType(type);
             r.setPdfUrl(file.toString());
             return reports.save(r);
-        } catch (IOException e) {
-            throw new UncheckedIOException("No se pudo guardar el PDF", e);
+        } catch (IOException ex) {
+            throw new UncheckedIOException("No se pudo guardar el PDF", ex);
         }
     }
 
-    private void markEmailed(Report report, boolean sent) {
-        if (sent) {
-            report.setEmailedAt(Instant.now());
-            reports.save(report);
-        }
+    private static String nullToEmpty(String s) {
+        return s == null ? "" : s;
     }
 }

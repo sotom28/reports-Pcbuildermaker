@@ -13,8 +13,8 @@ import org.springframework.stereotype.Service;
 import java.util.List;
 
 /**
- * Envia el PDF adjunto. El SMTP es opcional: sin spring.mail.host no hay JavaMailSender y se
- * registra en el log en vez de fallar (util en desarrollo y en tests).
+ * Envia correos, con o sin PDF adjunto. El SMTP es opcional: sin spring.mail.host no hay JavaMailSender
+ * y se registra en el log en vez de fallar (util en desarrollo y en tests).
  */
 @Slf4j
 @Service
@@ -33,8 +33,18 @@ public class MailService {
         this.smtpConfigured = smtpHost != null && !smtpHost.isBlank();
     }
 
-    /** @return true si se envio; false si no hay SMTP o no hay destinatarios. Lanza si el SMTP falla (reintenta el listener). */
+    /** Correo de texto plano, sin adjunto. */
+    public boolean send(List<String> to, String subject, String body) {
+        return send(to, subject, body, null, null);
+    }
+
+    /** Correo con el PDF adjunto. */
     public boolean sendPdf(List<String> to, String subject, String body, String filename, byte[] pdf) {
+        return send(to, subject, body, filename, pdf);
+    }
+
+    /** @return true si se envio; false si no hay SMTP o no hay destinatarios. Lanza si el SMTP falla (reintenta el listener). */
+    private boolean send(List<String> to, String subject, String body, String filename, byte[] pdf) {
         List<String> recipients = to.stream().filter(a -> a != null && !a.isBlank()).distinct().toList();
         JavaMailSender mailSender = smtpConfigured ? sender.getIfAvailable() : null;
         if (recipients.isEmpty() || mailSender == null) {
@@ -44,13 +54,16 @@ public class MailService {
         }
         try {
             MimeMessage message = mailSender.createMimeMessage();
-            MimeMessageHelper helper = new MimeMessageHelper(message, true, "UTF-8");
+            MimeMessageHelper helper = new MimeMessageHelper(message, pdf != null, "UTF-8");
             helper.setFrom(from);
             helper.setTo(recipients.toArray(String[]::new));
             helper.setSubject(subject);
             helper.setText(body);
-            helper.addAttachment(filename, new ByteArrayResource(pdf), "application/pdf");
+            if (pdf != null) {
+                helper.addAttachment(filename, new ByteArrayResource(pdf), "application/pdf");
+            }
             mailSender.send(message);
+            log.info("Correo '{}' enviado a {}", subject, recipients);
             return true;
         } catch (MessagingException e) {
             throw new IllegalStateException("No se pudo armar el correo", e);

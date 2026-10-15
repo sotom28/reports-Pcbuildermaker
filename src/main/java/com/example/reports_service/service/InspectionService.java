@@ -8,9 +8,7 @@ import com.example.reports_service.dto.InspectionDtos.InspectionResponse;
 import com.example.reports_service.exception.ApiExceptions.ConflictException;
 import com.example.reports_service.exception.ApiExceptions.NotFoundException;
 import com.example.reports_service.messaging.Events.ComponentCheck;
-import com.example.reports_service.messaging.Events.DeadlineReached;
 import com.example.reports_service.messaging.Events.InspectionCompleted;
-import com.example.reports_service.messaging.Events.InspectionDelayed;
 import com.example.reports_service.messaging.Events.OrderPaid;
 import com.example.reports_service.messaging.Events.PaidItem;
 import com.example.reports_service.messaging.OutboundMessage;
@@ -19,30 +17,29 @@ import com.example.reports_service.model.InspectionStatus;
 import com.example.reports_service.repository.InspectionRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.time.Duration;
 import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneId;
 import java.util.EnumSet;
 import java.util.List;
 
-/** El agente tecnico revisa cada pieza pagada ANTES de enviarla; de esa revision sale el informe. */
+/** El admin del taller revisa cada pieza pagada ANTES de enviarla; de esa revision sale el informe. */
 @Slf4j
 @Service
 @RequiredArgsConstructor
 @Transactional
 public class InspectionService {
 
+    private static final ZoneId WORKSHOP_ZONE = ZoneId.of("America/Santiago");
+
     private final InspectionRepository inspections;
     private final ApplicationEventPublisher events;
 
-    @Value("${app.inspection.deadline}")
-    private Duration deadline;
-
-    /** Pago retenido: crea una inspeccion pendiente por item y arranca el reloj del plazo. Idempotente. */
+    /** Pago confirmado: crea una inspeccion pendiente por item (aparece sola en la bandeja del admin). Idempotente. */
     public void registerPaidOrder(OrderPaid order) {
         for (PaidItem item : order.items()) {
             if (inspections.existsByOrderItemId(item.orderItemId())) {
@@ -57,32 +54,15 @@ public class InspectionService {
             i.setBuyerId(order.buyerId());
             i.setSellerId(item.sellerId());
             i.setBuyerEmail(order.buyerEmail());
-            i.setSellerEmail(item.sellerEmail());
-            i.setDueAt(i.getCreatedAt().plus(deadline));
             inspections.save(i);
-            // El TTL de la cola de espera lo devuelve a este servicio cuando se cumple el plazo.
-            events.publishEvent(new OutboundMessage(RabbitConfig.DELAY_EXCHANGE, RabbitConfig.KEY_WAIT,
-                    new DeadlineReached(i.getId())));
+            log.info("Inspeccion {} creada para el item {} (orden {})", i.getId(), item.orderItemId(), order.orderId());
         }
-    }
-
-    /** El plazo vencio: si la inspeccion sigue abierta se avisa al cliente, pero no se cancela nada. */
-    public void onDeadline(String inspectionId) {
-        Inspection i = inspections.findById(inspectionId).orElse(null);
-        if (i == null || !i.getStatus().isOpen() || i.getDelayNotifiedAt() != null) {
-            return;
-        }
-        i.setDelayNotifiedAt(Instant.now());
-        events.publishEvent(new OutboundMessage(RabbitConfig.EVENTS_EXCHANGE, RabbitConfig.KEY_DELAYED,
-                new InspectionDelayed(RabbitConfig.KEY_DELAYED, Instant.now(), i.getId(), i.getOrderId(),
-                        i.getOrderItemId(), i.getDescription(), i.getSellerId(), i.getBuyerId(),
-                        i.getSellerEmail(), i.getBuyerEmail(), i.getDueAt())));
     }
 
     @Transactional(readOnly = true)
     public List<InspectionResponse> listOpen(AuthContext auth) {
         auth.requireAgent();
-        return inspections.findByStatusInOrderByDueAtAsc(EnumSet.of(InspectionStatus.PENDING, InspectionStatus.IN_REVIEW))
+        return inspections.findByStatusInOrderByCreatedAtAsc(EnumSet.of(InspectionStatus.PENDING, InspectionStatus.IN_REVIEW))
                 .stream().map(InspectionResponse::from).toList();
     }
 
@@ -100,7 +80,7 @@ public class InspectionService {
         return InspectionResponse.from(i);
     }
 
-    /** Participantes de la inspeccion (comprador, vendedor) y agentes; el resto recibe 404. */
+    /** Participantes de la inspeccion (comprador, vendedor) y admins; el resto recibe 404. */
     @Transactional(readOnly = true)
     public Inspection requireParticipantByItem(AuthContext auth, String orderItemId) {
         Inspection i = inspections.findByOrderItemId(orderItemId)
@@ -109,7 +89,7 @@ public class InspectionService {
         return i;
     }
 
-    /** El agente toma la revision. */
+    /** El admin toma la revision (opcional: complete tambien funciona desde PENDING). */
     public InspectionResponse claim(AuthContext auth, String id) {
         auth.requireAgent();
         Inspection i = load(id);
@@ -121,7 +101,7 @@ public class InspectionService {
         return InspectionResponse.from(i);
     }
 
-    /** El agente cierra la revision: aprobada o rechazada. Dispara el informe PDF y el correo. */
+    /** El admin envia el formulario: aprobada o rechazada. Dispara confirmacion por correo + PDF. */
     public InspectionResponse complete(AuthContext auth, String id, CompleteRequest request) {
         auth.requireAgent();
         if (request.result() != InspectionStatus.PASSED && request.result() != InspectionStatus.FAILED) {
@@ -137,19 +117,31 @@ public class InspectionService {
         Instant now = Instant.now();
         i.setStatus(request.result());
         i.setAgentId(auth.userId());
+        i.setMaintenanceDone(request.maintenanceDone());
+        i.setMaintenanceDate(request.maintenanceDate() != null ? request.maintenanceDate() : LocalDate.now(WORKSHOP_ZONE));
         i.setWorkshopNotes(request.notes());
         i.setCompletedAt(now);
         i.getChecks().clear();
         List<CheckRequest> checks = request.checks() == null ? List.of() : request.checks();
         checks.forEach(c -> i.getChecks().add(new Inspection.CheckEntry(c.component(), c.result(), c.note())));
 
-        events.publishEvent(new OutboundMessage(RabbitConfig.EVENTS_EXCHANGE, RabbitConfig.KEY_COMPLETED,
+        events.publishEvent(new OutboundMessage(RabbitConfig.EXCHANGE, RabbitConfig.KEY_COMPLETED,
                 new InspectionCompleted(RabbitConfig.KEY_COMPLETED, now, i.getId(), i.getOrderId(), i.getOrderItemId(),
-                        i.getPublicationId(), i.getDescription(), i.getSellerId(), i.getBuyerId(), i.getSellerEmail(),
-                        i.getBuyerEmail(), i.getStatus(), i.getWorkshopNotes(), i.getAgentId(),
-                        checks.stream().map(c -> new ComponentCheck(c.component(), c.result(), c.note())).toList(),
-                        i.getDueAt(), now.isAfter(i.getDueAt()))));
+                        i.getPublicationId(), i.getDescription(), i.getSellerId(), i.getBuyerId(), i.getBuyerEmail(),
+                        i.getStatus(), i.getMaintenanceDone(), i.getMaintenanceDate(), i.getWorkshopNotes(),
+                        i.getAgentId(),
+                        checks.stream().map(c -> new ComponentCheck(c.component(), c.result(), c.note())).toList())));
         return InspectionResponse.from(i);
+    }
+
+    /** Marca el correo de confirmacion como enviado (evita duplicarlo si RabbitMQ reentrega el mensaje). */
+    public void markConfirmationEmailed(String inspectionId) {
+        load(inspectionId).setConfirmationEmailedAt(Instant.now());
+    }
+
+    @Transactional(readOnly = true)
+    public boolean isConfirmationEmailed(String inspectionId) {
+        return load(inspectionId).getConfirmationEmailedAt() != null;
     }
 
     private Inspection load(String id) {

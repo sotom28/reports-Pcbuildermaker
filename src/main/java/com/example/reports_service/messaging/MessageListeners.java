@@ -1,10 +1,9 @@
 package com.example.reports_service.messaging;
 
 import com.example.reports_service.config.RabbitConfig;
-import com.example.reports_service.messaging.Events.DeadlineReached;
 import com.example.reports_service.messaging.Events.InspectionCompleted;
-import com.example.reports_service.messaging.Events.InspectionDelayed;
 import com.example.reports_service.messaging.Events.OrderPaid;
+import com.example.reports_service.messaging.Events.ReportGenerated;
 import com.example.reports_service.service.InspectionService;
 import com.example.reports_service.service.ReportService;
 import lombok.RequiredArgsConstructor;
@@ -18,27 +17,27 @@ public class MessageListeners {
     private final InspectionService inspections;
     private final ReportService reports;
 
-    /** Pedido pagado: cada pieza queda en la bandeja del agente tecnico, antes de enviarse. */
+    /** Pedido pagado: cada pieza queda en la bandeja del admin, antes de enviarse. */
     @RabbitListener(queues = RabbitConfig.Q_NEW_ORDER)
     public void onOrderPaid(OrderPaid event) {
         inspections.registerPaidOrder(event);
     }
 
-    /** Llega aqui cuando el mensaje de la cola de espera vence (dead-letter). */
-    @RabbitListener(queues = RabbitConfig.Q_DEADLINE)
-    public void onDeadline(DeadlineReached message) {
-        inspections.onDeadline(message.inspectionId());
+    /** Formulario enviado -> correo de confirmacion al comprador. */
+    @RabbitListener(queues = RabbitConfig.Q_MAIL_CONFIRMATION)
+    public void onConfirmationMail(InspectionCompleted event) {
+        reports.sendConfirmation(event);
     }
 
-    /** Revision terminada: PDF del informe por componente y correo. */
-    @RabbitListener(queues = RabbitConfig.Q_TECHNICAL_REVIEW)
-    public void onInspectionCompleted(InspectionCompleted event) {
-        reports.onCompleted(event);
+    /** Formulario enviado -> genera el PDF y avisa con report.generated. */
+    @RabbitListener(queues = RabbitConfig.Q_REPORT_GENERATE)
+    public void onGenerateReport(InspectionCompleted event) {
+        reports.generate(event);
     }
 
-    /** Plazo vencido sin revisar: PDF de aviso y correo al cliente. */
-    @RabbitListener(queues = RabbitConfig.Q_DELAY_NOTICE)
-    public void onInspectionDelayed(InspectionDelayed event) {
-        reports.onDelayed(event);
+    /** PDF generado -> correo con el PDF adjunto. */
+    @RabbitListener(queues = RabbitConfig.Q_MAIL_REPORT)
+    public void onReportMail(ReportGenerated event) {
+        reports.mailReport(event);
     }
 }

@@ -3,15 +3,16 @@ package com.example.reports_service.messaging;
 import com.example.reports_service.model.InspectionStatus;
 
 import java.time.Instant;
+import java.time.LocalDate;
 import java.util.List;
 
-/** Payloads JSON que viajan por RabbitMQ. Solo IDs y datos para armar el PDF, sin llamadas de vuelta. */
+/** Payloads JSON que viajan por RabbitMQ. Solo IDs y datos para armar el PDF y los correos, sin llamadas de vuelta. */
 public final class Events {
 
     private Events() {
     }
 
-    /** Entrante: payments publica esto cuando el pago queda retenido (escrow). Un item = una pieza a revisar. */
+    /** Entrante: payments publica esto cuando el pago queda confirmado. Un item = una pieza a revisar. */
     public record OrderPaid(
             String orderId,
             String buyerId,
@@ -24,13 +25,8 @@ public final class Events {
             String orderItemId,
             String publicationId,
             String sellerId,
-            String sellerEmail,
             String description,
             Integer price) {
-    }
-
-    /** Mensaje temporizador: vuelve a este servicio al vencer el plazo. */
-    public record DeadlineReached(String inspectionId) {
     }
 
     /** Resultado de revisar un componente (CPU, GPU, fuente...). */
@@ -39,7 +35,7 @@ public final class Events {
 
     public enum ComponentResult { OK, WARNING, FAIL }
 
-    /** Saliente: el agente termino la revision. Lo consume la cola de informes (PDF + correo) y otros servicios. */
+    /** Saliente: el admin envio el formulario. Lo consumen la cola de confirmacion y la de generacion del PDF. */
     public record InspectionCompleted(
             String eventType,
             Instant timestamp,
@@ -50,28 +46,25 @@ public final class Events {
             String description,
             String sellerId,
             String buyerId,
-            String sellerEmail,
             String buyerEmail,
             InspectionStatus inspectionStatus,
+            String maintenanceDone,
+            LocalDate maintenanceDate,
             String workshopNotes,
             String inspectedBy,
-            List<ComponentCheck> checks,
-            Instant dueAt,
-            boolean late) {
+            List<ComponentCheck> checks) {
     }
 
-    /** Saliente: paso el plazo sin revision. Genera el PDF de aviso y el correo al cliente. */
-    public record InspectionDelayed(
+    /** Saliente: el PDF ya existe. Lo consume la cola que lo envia por correo. */
+    public record ReportGenerated(
             String eventType,
             Instant timestamp,
+            String reportId,
             String inspectionId,
             String orderId,
             String orderItemId,
             String description,
-            String sellerId,
-            String buyerId,
-            String sellerEmail,
             String buyerEmail,
-            Instant dueAt) {
+            InspectionStatus inspectionStatus) {
     }
 }

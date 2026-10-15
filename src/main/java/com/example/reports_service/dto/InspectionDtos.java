@@ -9,6 +9,7 @@ import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Size;
 
 import java.time.Instant;
+import java.time.LocalDate;
 import java.util.List;
 
 public final class InspectionDtos {
@@ -22,11 +23,16 @@ public final class InspectionDtos {
             @Size(max = 255) String note) {
     }
 
-    /** result: PASSED o FAILED. checks: estado de cada componente revisado (aparece en el PDF). */
+    /**
+     * Formulario del admin. result: PASSED o FAILED. maintenanceDate es opcional (por defecto, hoy).
+     * checks es opcional: estado de cada componente revisado, aparece en el PDF si viene.
+     */
     public record CompleteRequest(
             @NotNull InspectionStatus result,
+            @NotBlank @Size(max = 1000) String maintenanceDone,
+            LocalDate maintenanceDate,
             @Size(max = 1000) String notes,
-            @Valid List<CheckRequest> checks) {
+            List<@Valid CheckRequest> checks) {
     }
 
     public record CheckResponse(String component, ComponentResult result, String note) {
@@ -39,23 +45,23 @@ public final class InspectionDtos {
             String publicationId,
             String description,
             String buyerId,
+            String buyerEmail,
             String sellerId,
             InspectionStatus status,
             String agentId,
+            String maintenanceDone,
+            LocalDate maintenanceDate,
             String workshopNotes,
             List<CheckResponse> checks,
-            Instant dueAt,
-            boolean overdue,
             Instant completedAt,
             Instant createdAt) {
 
         public static InspectionResponse from(Inspection i) {
-            boolean overdue = i.getStatus().isOpen() && Instant.now().isAfter(i.getDueAt());
             return new InspectionResponse(i.getId(), i.getOrderId(), i.getOrderItemId(), i.getPublicationId(),
-                    i.getDescription(), i.getBuyerId(), i.getSellerId(), i.getStatus(), i.getAgentId(),
-                    i.getWorkshopNotes(),
+                    i.getDescription(), i.getBuyerId(), i.getBuyerEmail(), i.getSellerId(), i.getStatus(),
+                    i.getAgentId(), i.getMaintenanceDone(), i.getMaintenanceDate(), i.getWorkshopNotes(),
                     i.getChecks().stream().map(c -> new CheckResponse(c.getComponent(), c.getResult(), c.getNote())).toList(),
-                    i.getDueAt(), overdue, i.getCompletedAt(), i.getCreatedAt());
+                    i.getCompletedAt(), i.getCreatedAt());
         }
     }
 }

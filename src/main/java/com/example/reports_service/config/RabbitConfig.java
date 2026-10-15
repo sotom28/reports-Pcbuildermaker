@@ -2,119 +2,86 @@ package com.example.reports_service.config;
 
 import org.springframework.amqp.core.Binding;
 import org.springframework.amqp.core.BindingBuilder;
+import org.springframework.amqp.core.Declarable;
+import org.springframework.amqp.core.Declarables;
 import org.springframework.amqp.core.DirectExchange;
 import org.springframework.amqp.core.Queue;
 import org.springframework.amqp.core.QueueBuilder;
-import org.springframework.amqp.core.TopicExchange;
 import org.springframework.amqp.support.converter.JacksonJsonMessageConverter;
 import org.springframework.amqp.support.converter.MessageConverter;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
-import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
- * Topologia de RabbitMQ de reports-service.
+ * Topologia de RabbitMQ: un unico exchange direct con tres routing keys.
  *
  * <pre>
- * payments --order.paid--> [pcmarketbuilder.events: topic] --> reports.new-order --> crea una inspeccion por item
+ * payments --order.paid--> [pcmarketbuilder.direct] --> reports.new-order --> crea una inspeccion por item
  *
- * (al crear la inspeccion) --> [pcmarketbuilder.delay: direct] --> reports.wait-deadline
- *     cola SIN consumidor con TTL = plazo (72 h); al vencer RabbitMQ la reenvia por dead-letter:
- *     --inspection.deadline--> [pcmarketbuilder.events] --> reports.deadline --> aviso de retraso
- *
- * agente cierra la revision --inspection.completed--> reports.technical-review --> PDF del informe + correo
- * plazo vencido sin revisar --inspection.delayed----> reports.delay-notice -----> PDF de aviso + correo
+ * admin envia el formulario --inspection.completed--> [pcmarketbuilder.direct]
+ *     |-> mail.confirmation : correo "todo salio bien, tu pieza sera enviada"
+ *     '-> report.generate   : genera y guarda el PDF --report.generated--> [pcmarketbuilder.direct]
+ *                                 '-> mail.report : correo con el PDF adjunto
  * </pre>
  *
- * Otros servicios (payments, shipments) pueden bindear su propia cola a inspection.completed.
+ * Dos colas con la misma routing key (inspection.completed) = cada una recibe su propia copia,
+ * asi la confirmacion y el PDF corren en paralelo y se reintentan por separado.
+ *
+ * Toda cola de trabajo tiene una cola muerta (&lt;cola&gt;.dlq): si un listener agota sus reintentos el
+ * mensaje cae ahi en vez de perderse.
  */
 @Configuration
 public class RabbitConfig {
 
-    public static final String EVENTS_EXCHANGE = "pcmarketbuilder.events";
-    public static final String DELAY_EXCHANGE = "pcmarketbuilder.delay";
+    public static final String EXCHANGE = "pcmarketbuilder.direct";
+    public static final String DLX = "pcmarketbuilder.dlx";
 
     public static final String KEY_ORDER_PAID = "order.paid";
-    public static final String KEY_DEADLINE = "inspection.deadline";
     public static final String KEY_COMPLETED = "inspection.completed";
-    public static final String KEY_DELAYED = "inspection.delayed";
-    public static final String KEY_WAIT = "inspection.wait";
+    public static final String KEY_REPORT_GENERATED = "report.generated";
 
     public static final String Q_NEW_ORDER = "reports.new-order";
-    public static final String Q_WAIT = "reports.wait-deadline";
-    public static final String Q_DEADLINE = "reports.deadline";
-    public static final String Q_TECHNICAL_REVIEW = "reports.technical-review";
-    public static final String Q_DELAY_NOTICE = "reports.delay-notice";
+    public static final String Q_MAIL_CONFIRMATION = "mail.confirmation";
+    public static final String Q_REPORT_GENERATE = "report.generate";
+    public static final String Q_MAIL_REPORT = "mail.report";
+
+    private static final String DLQ_SUFFIX = ".dlq";
 
     @Bean
-    TopicExchange eventsExchange() {
-        return new TopicExchange(EVENTS_EXCHANGE, true, false);
+    DirectExchange directExchange() {
+        return new DirectExchange(EXCHANGE, true, false);
     }
 
     @Bean
-    DirectExchange delayExchange() {
-        return new DirectExchange(DELAY_EXCHANGE, true, false);
+    DirectExchange deadLetterExchange() {
+        return new DirectExchange(DLX, true, false);
     }
 
+    /** Colas de trabajo + sus bindings + sus colas muertas, todo declarado junto. */
     @Bean
-    Queue newOrderQueue() {
-        return QueueBuilder.durable(Q_NEW_ORDER).build();
+    Declarables topology(DirectExchange directExchange, DirectExchange deadLetterExchange) {
+        List<Declarable> all = new ArrayList<>();
+        bind(all, directExchange, deadLetterExchange, Q_NEW_ORDER, KEY_ORDER_PAID);
+        bind(all, directExchange, deadLetterExchange, Q_MAIL_CONFIRMATION, KEY_COMPLETED);
+        bind(all, directExchange, deadLetterExchange, Q_REPORT_GENERATE, KEY_COMPLETED);
+        bind(all, directExchange, deadLetterExchange, Q_MAIL_REPORT, KEY_REPORT_GENERATED);
+        return new Declarables(all);
     }
 
-    @Bean
-    Queue deadlineQueue() {
-        return QueueBuilder.durable(Q_DEADLINE).build();
-    }
-
-    @Bean
-    Queue technicalReviewQueue() {
-        return QueueBuilder.durable(Q_TECHNICAL_REVIEW).build();
-    }
-
-    @Bean
-    Queue delayNoticeQueue() {
-        return QueueBuilder.durable(Q_DELAY_NOTICE).build();
-    }
-
-    /**
-     * TTL a nivel de cola (no por mensaje): el TTL por mensaje solo expira cuando el mensaje
-     * llega al frente de la cola, y como todos esperan lo mismo la cola es FIFO y alcanza.
-     * Cambiar el plazo en una cola ya creada exige borrarla en RabbitMQ (reports.wait-deadline).
-     */
-    @Bean
-    Queue waitQueue(@Value("${app.inspection.deadline}") Duration deadline) {
-        return QueueBuilder.durable(Q_WAIT)
-                .ttl((int) deadline.toMillis())
-                .deadLetterExchange(EVENTS_EXCHANGE)
-                .deadLetterRoutingKey(KEY_DEADLINE)
+    private static void bind(List<Declarable> all, DirectExchange exchange, DirectExchange dlx,
+                             String queueName, String routingKey) {
+        Queue queue = QueueBuilder.durable(queueName)
+                .deadLetterExchange(DLX)
+                .deadLetterRoutingKey(queueName + DLQ_SUFFIX)
                 .build();
-    }
-
-    @Bean
-    Binding newOrderBinding(Queue newOrderQueue, TopicExchange eventsExchange) {
-        return BindingBuilder.bind(newOrderQueue).to(eventsExchange).with(KEY_ORDER_PAID);
-    }
-
-    @Bean
-    Binding deadlineBinding(Queue deadlineQueue, TopicExchange eventsExchange) {
-        return BindingBuilder.bind(deadlineQueue).to(eventsExchange).with(KEY_DEADLINE);
-    }
-
-    @Bean
-    Binding technicalReviewBinding(Queue technicalReviewQueue, TopicExchange eventsExchange) {
-        return BindingBuilder.bind(technicalReviewQueue).to(eventsExchange).with(KEY_COMPLETED);
-    }
-
-    @Bean
-    Binding delayNoticeBinding(Queue delayNoticeQueue, TopicExchange eventsExchange) {
-        return BindingBuilder.bind(delayNoticeQueue).to(eventsExchange).with(KEY_DELAYED);
-    }
-
-    @Bean
-    Binding waitBinding(Queue waitQueue, DirectExchange delayExchange) {
-        return BindingBuilder.bind(waitQueue).to(delayExchange).with(KEY_WAIT);
+        Queue dead = QueueBuilder.durable(queueName + DLQ_SUFFIX).build();
+        all.add(queue);
+        all.add(dead);
+        all.add(BindingBuilder.bind(queue).to(exchange).with(routingKey));
+        all.add(BindingBuilder.bind(dead).to(dlx).with(queueName + DLQ_SUFFIX));
     }
 
     /** JSON entre servicios. Se ignora el header __TypeId__ del productor (clases distintas por servicio). */

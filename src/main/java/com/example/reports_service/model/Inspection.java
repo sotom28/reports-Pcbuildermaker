@@ -7,6 +7,7 @@ import lombok.NoArgsConstructor;
 import lombok.Setter;
 
 import java.time.Instant;
+import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -44,34 +45,35 @@ public class Inspection {
     @Column(nullable = false, length = 64)
     private String sellerId;
 
+    /** Correo que el comprador indico al pagar. Unico destinatario de confirmacion e informe. */
     @Column(length = 150)
     private String buyerEmail;
-
-    @Column(length = 150)
-    private String sellerEmail;
 
     @Enumerated(EnumType.STRING)
     @Column(nullable = false, length = 20)
     private InspectionStatus status = InspectionStatus.PENDING;
 
-    /** Agente tecnico que tomo la revision (azure_oid). */
+    /** Admin del taller que cerro la revision (azure_oid). */
     @Column(length = 64)
     private String agentId;
+
+    /** Formulario: que mantenimiento se le hizo a la pieza. */
+    @Column(length = 1000)
+    private String maintenanceDone;
+
+    /** Formulario: fecha en que se hizo el mantenimiento. */
+    private LocalDate maintenanceDate;
 
     @Column(length = 1000)
     private String workshopNotes;
 
-    /** Revision componente por componente (CPU, GPU, fuente...). */
+    /** Revision componente por componente (CPU, GPU, fuente...). Opcional. */
     @ElementCollection(fetch = FetchType.EAGER)
     @CollectionTable(name = "inspection_checks", joinColumns = @JoinColumn(name = "inspection_id"))
     private List<CheckEntry> checks = new ArrayList<>();
 
-    /** Fecha limite del plazo; pasada no se cancela, solo se avisa al cliente. */
-    @Column(nullable = false)
-    private Instant dueAt;
-
-    /** Cuando se envio el aviso de retraso (null = no se ha enviado). */
-    private Instant delayNotifiedAt;
+    /** Cuando se envio el correo de confirmacion (null = aun no). Evita duplicarlo si RabbitMQ reentrega. */
+    private Instant confirmationEmailedAt;
 
     private Instant completedAt;
 

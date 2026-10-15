@@ -14,7 +14,8 @@ public interface InspectionRepository extends JpaRepository<Inspection, String> 
 
     Optional<Inspection> findByOrderItemId(String orderItemId);
 
-    List<Inspection> findByStatusInOrderByDueAtAsc(Collection<InspectionStatus> statuses);
+    /** Bandeja del admin: las mas antiguas primero. */
+    List<Inspection> findByStatusInOrderByCreatedAtAsc(Collection<InspectionStatus> statuses);
 
     List<Inspection> findByAgentIdOrderByCreatedAtDesc(String agentId);
 }

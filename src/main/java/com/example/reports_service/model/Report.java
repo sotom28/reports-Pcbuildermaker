@@ -16,7 +16,7 @@ import java.util.UUID;
 @NoArgsConstructor
 public class Report {
 
-    public enum Type { TECHNICAL_REPORT, DELAY_NOTICE }
+    public enum Type { TECHNICAL_REPORT }
 
     @Id
     @Column(length = 36)
