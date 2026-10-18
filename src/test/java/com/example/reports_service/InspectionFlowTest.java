@@ -202,6 +202,59 @@ class InspectionFlowTest {
         assertTrue(service.listAsBuyer(new AuthContext("buyer-3", null)).isEmpty());
     }
 
+    static final AuthContext SELLER = new AuthContext("seller-1", null);
+
+    @Test
+    void elAdminEntregaLaPiezaAprobadaYLaOperacionEsIdempotente() {
+        service.registerPaidOrder(order("10"));
+        String id = openId("10");
+        service.complete(ADMIN, id, form(InspectionStatus.PASSED));
+
+        assertTrue(service.listToDeliver(ADMIN).stream().anyMatch(i -> i.orderItemId().equals("item-10")));
+
+        var first = service.deliver(ADMIN, id);
+        assertNotNull(first.deliveredAt());
+        var again = service.deliver(ADMIN, id); // reintento del BFF: mismo estado, sin error
+        assertEquals(first.deliveredAt(), again.deliveredAt());
+
+        assertTrue(service.listToDeliver(ADMIN).stream().noneMatch(i -> i.orderItemId().equals("item-10")),
+                "ya entregada: sale de 'por entregar'");
+    }
+
+    @Test
+    void soloSePuedeEntregarUnaPiezaAprobada() {
+        service.registerPaidOrder(order("11"));
+        String pendiente = openId("11");
+        assertThrows(ConflictException.class, () -> service.deliver(ADMIN, pendiente));
+
+        service.registerPaidOrder(order("12"));
+        String rechazada = openId("12");
+        service.complete(ADMIN, rechazada, form(InspectionStatus.FAILED));
+        assertThrows(ConflictException.class, () -> service.deliver(ADMIN, rechazada));
+
+        assertThrows(ForbiddenException.class, () -> service.deliver(BUYER, rechazada));
+        assertThrows(ForbiddenException.class, () -> service.listToDeliver(BUYER));
+    }
+
+    @Test
+    void elVendedorVeSoloSusVentasEnFormatoReducido() {
+        service.registerPaidOrder(order("13")); // vendedor seller-1
+        service.registerPaidOrder(new OrderPaid("order-14", "buyer-2", "otro@correo.cl", Instant.now(),
+                List.of(new PaidItem("item-14", "pub-14", "seller-2", "SSD 1TB", 60000))));
+
+        var mias = service.listAsSeller(SELLER);
+        assertTrue(mias.stream().anyMatch(v -> v.orderItemId().equals("item-13")));
+        assertTrue(mias.stream().noneMatch(v -> v.orderItemId().equals("item-14")), "no ve ventas ajenas");
+        var venta = mias.stream().filter(v -> v.orderItemId().equals("item-13")).findFirst().orElseThrow();
+        assertEquals("buyer-1", venta.buyerId()); // el BFF lo usa para resolver el nombre y no lo reenvia
+        assertEquals(InspectionStatus.PENDING, venta.status());
+        assertTrue(service.listAsSeller(new AuthContext("seller-9", null)).isEmpty());
+        // SaleResponse no tiene campo de correo ni de notas: lo garantiza el tipo
+        assertEquals(10, venta.getClass().getRecordComponents().length);
+        assertTrue(java.util.Arrays.stream(venta.getClass().getRecordComponents())
+                .noneMatch(c -> c.getName().toLowerCase().contains("email") || c.getName().toLowerCase().contains("notes")));
+    }
+
     @Test
     void soloElAdminOperaLaBandeja() {
         assertThrows(ForbiddenException.class, () -> service.listOpen(BUYER));

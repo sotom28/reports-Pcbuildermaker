@@ -21,4 +21,10 @@ public interface InspectionRepository extends JpaRepository<Inspection, String> 
 
     /** Compras del usuario ("Mis compras"). */
     List<Inspection> findByBuyerIdOrderByCreatedAtDesc(String buyerId);
+
+    /** Ventas del usuario ("Mis ventas"). */
+    List<Inspection> findBySellerIdOrderByCreatedAtDesc(String sellerId);
+
+    /** Aprobadas que el taller aun no entrega: la pestana "Por entregar" del admin, las mas antiguas primero. */
+    List<Inspection> findByStatusAndDeliveredAtIsNullOrderByCompletedAtAsc(InspectionStatus status);
 }

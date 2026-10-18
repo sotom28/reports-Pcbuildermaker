@@ -24,9 +24,12 @@ public class InspectionController {
 
     private final InspectionService inspections;
 
-    /** Bandeja del admin: abiertas (las mas antiguas primero), ?scope=mine (las que cerro) o ?scope=buyer (mis compras). */
+    /**
+     * ?scope=open (default, admin): pendientes de revision, las mas antiguas primero. mine (admin): las que cerro.
+     * to-deliver (admin): aprobadas sin entregar. buyer: mis compras. seller: mis ventas (formato reducido).
+     */
     @GetMapping
-    public List<InspectionResponse> list(
+    public List<?> list(
             @RequestHeader(value = AuthContext.USER_ID_HEADER, required = false) String userId,
             @RequestHeader(value = AuthContext.ROLE_HEADER, required = false) String role,
             @RequestParam(value = "scope", defaultValue = "open") String scope) {
@@ -34,8 +37,11 @@ public class InspectionController {
         return switch (scope) {
             case "open" -> inspections.listOpen(auth);
             case "mine" -> inspections.listMine(auth);
+            case "to-deliver" -> inspections.listToDeliver(auth);
             case "buyer" -> inspections.listAsBuyer(auth);
-            default -> throw new IllegalArgumentException("El parametro 'scope' debe ser 'open', 'mine' o 'buyer'");
+            case "seller" -> inspections.listAsSeller(auth);
+            default -> throw new IllegalArgumentException(
+                    "El parametro 'scope' debe ser 'open', 'mine', 'to-deliver', 'buyer' o 'seller'");
         };
     }
 
@@ -53,6 +59,14 @@ public class InspectionController {
             @RequestHeader(value = AuthContext.ROLE_HEADER, required = false) String role,
             @PathVariable String id) {
         return inspections.claim(new AuthContext(userId, role), id);
+    }
+
+    @PostMapping("/{id}/deliver")
+    public InspectionResponse deliver(
+            @RequestHeader(value = AuthContext.USER_ID_HEADER, required = false) String userId,
+            @RequestHeader(value = AuthContext.ROLE_HEADER, required = false) String role,
+            @PathVariable String id) {
+        return inspections.deliver(new AuthContext(userId, role), id);
     }
 
     @PostMapping("/{id}/complete")
