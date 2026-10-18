@@ -5,6 +5,7 @@ import com.example.reports_service.config.RabbitConfig;
 import com.example.reports_service.dto.InspectionDtos.CheckRequest;
 import com.example.reports_service.dto.InspectionDtos.CompleteRequest;
 import com.example.reports_service.dto.InspectionDtos.InspectionResponse;
+import com.example.reports_service.dto.InspectionDtos.SaleResponse;
 import com.example.reports_service.exception.ApiExceptions.ConflictException;
 import com.example.reports_service.exception.ApiExceptions.NotFoundException;
 import com.example.reports_service.messaging.Events.ComponentCheck;
@@ -78,6 +79,38 @@ public class InspectionService {
     public List<InspectionResponse> listAsBuyer(AuthContext auth) {
         return inspections.findByBuyerIdOrderByCreatedAtDesc(auth.userId())
                 .stream().map(InspectionResponse::from).toList();
+    }
+
+    /** Las ventas del usuario (no requiere ser admin): solo las piezas que EL vendio, en un formato reducido. */
+    @Transactional(readOnly = true)
+    public List<SaleResponse> listAsSeller(AuthContext auth) {
+        return inspections.findBySellerIdOrderByCreatedAtDesc(auth.userId())
+                .stream().map(SaleResponse::from).toList();
+    }
+
+    /** Aprobadas pendientes de entrega (pestana "Por entregar" del admin). */
+    @Transactional(readOnly = true)
+    public List<InspectionResponse> listToDeliver(AuthContext auth) {
+        auth.requireAgent();
+        return inspections.findByStatusAndDeliveredAtIsNullOrderByCompletedAtAsc(InspectionStatus.PASSED)
+                .stream().map(InspectionResponse::from).toList();
+    }
+
+    /**
+     * El taller entrega la pieza aprobada al comprador. Solo aplica a PASSED. Es IDEMPOTENTE: si ya estaba entregada
+     * responde con el mismo estado (permite que el BFF reintente el paso de actualizar la publicacion).
+     */
+    public InspectionResponse deliver(AuthContext auth, String id) {
+        auth.requireAgent();
+        Inspection i = load(id);
+        if (i.getStatus() != InspectionStatus.PASSED) {
+            throw new ConflictException("Solo se puede entregar una pieza aprobada (estado " + i.getStatus() + ")");
+        }
+        if (i.getDeliveredAt() == null) {
+            // Milisegundos: la primera respuesta debe coincidir con lo que luego se lee de la base (que redondea).
+            i.setDeliveredAt(Instant.now().truncatedTo(java.time.temporal.ChronoUnit.MILLIS));
+        }
+        return InspectionResponse.from(i);
     }
 
     @Transactional(readOnly = true)

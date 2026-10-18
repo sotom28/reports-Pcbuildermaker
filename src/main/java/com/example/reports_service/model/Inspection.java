@@ -77,6 +77,9 @@ public class Inspection {
 
     private Instant completedAt;
 
+    /** Cuando el taller marco la pieza como entregada al comprador (null = aun no; solo tiene sentido si PASSED). */
+    private Instant deliveredAt;
+
     @Column(nullable = false, updatable = false)
     private Instant createdAt = Instant.now();
 

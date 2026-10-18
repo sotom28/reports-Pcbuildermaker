@@ -54,6 +54,7 @@ public final class InspectionDtos {
             String workshopNotes,
             List<CheckResponse> checks,
             Instant completedAt,
+            Instant deliveredAt,
             Instant createdAt) {
 
         public static InspectionResponse from(Inspection i) {
@@ -61,7 +62,31 @@ public final class InspectionDtos {
                     i.getDescription(), i.getBuyerId(), i.getBuyerEmail(), i.getSellerId(), i.getStatus(),
                     i.getAgentId(), i.getMaintenanceDone(), i.getMaintenanceDate(), i.getWorkshopNotes(),
                     i.getChecks().stream().map(c -> new CheckResponse(c.getComponent(), c.getResult(), c.getNote())).toList(),
-                    i.getCompletedAt(), i.getCreatedAt());
+                    i.getCompletedAt(), i.getDeliveredAt(), i.getCreatedAt());
+        }
+    }
+
+    /**
+     * Lo que ve el VENDEDOR de una venta: sin correo del comprador, sin notas ni detalle del mantenimiento (eso va
+     * en el informe PDF, que es del comprador). buyerId existe solo para que el BFF resuelva el nombre publico; el BFF
+     * no lo reenvia al front.
+     */
+    public record SaleResponse(
+            String id,
+            String orderId,
+            String orderItemId,
+            String publicationId,
+            String description,
+            String buyerId,
+            InspectionStatus status,
+            Instant completedAt,
+            Instant deliveredAt,
+            Instant createdAt) {
+
+        public static SaleResponse from(Inspection i) {
+            return new SaleResponse(i.getId(), i.getOrderId(), i.getOrderItemId(), i.getPublicationId(),
+                    i.getDescription(), i.getBuyerId(), i.getStatus(), i.getCompletedAt(), i.getDeliveredAt(),
+                    i.getCreatedAt());
         }
     }
 }
