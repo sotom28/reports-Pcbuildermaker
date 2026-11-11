@@ -2,16 +2,19 @@ package com.example.reports_service.service;
 
 import com.example.reports_service.config.RabbitConfig;
 import com.example.reports_service.exception.ApiExceptions.NotFoundException;
+import com.example.reports_service.mail.MailResult;
 import com.example.reports_service.mail.MailService;
 import com.example.reports_service.messaging.Events.InspectionCompleted;
 import com.example.reports_service.messaging.Events.ReportGenerated;
 import com.example.reports_service.messaging.OutboundMessage;
 import com.example.reports_service.model.InspectionStatus;
+import com.example.reports_service.model.NotificationStatus;
 import com.example.reports_service.model.Report;
 import com.example.reports_service.pdf.PdfReportGenerator;
 import com.example.reports_service.repository.ReportRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.amqp.AmqpRejectAndDontRequeueException;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.core.io.FileSystemResource;
@@ -21,6 +24,7 @@ import org.springframework.stereotype.Service;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.List;
@@ -59,11 +63,14 @@ public class ReportService {
                   + "y la pieza no aprobó las pruebas del taller, por lo que no será enviada.\n\n"
                   + "Detalle: " + e.maintenanceDone() + "\n\n"
                   + "En unos instantes recibirás otro correo con el informe técnico en PDF.\n\nPC Market Builder";
-        boolean sent = mail.send(List.of(nullToEmpty(e.buyerEmail())),
+        MailResult result = mail.send(List.of(nullToEmpty(e.buyerEmail())),
                 approved ? "Tu pieza pasó la revisión técnica y será enviada" : "Tu pieza no aprobó la revisión técnica",
                 body);
-        if (sent) {
-            inspections.markConfirmationEmailed(e.inspectionId());
+        if (result.sent()) {
+            inspections.markConfirmationSent(e.inspectionId());
+        } else {
+            // Reintentar no lo arregla (sin SMTP o sin destinatario): se deja constancia y el admin puede reenviarlo luego.
+            inspections.recordConfirmation(e.inspectionId(), NotificationStatus.NOT_SENT, result.reason());
         }
     }
 
@@ -80,18 +87,22 @@ public class ReportService {
             log.info("Informe del item {} ya existe", e.orderItemId());
             if (existing.getEmailedAt() == null) {
                 announce(existing, e);
+            } else {
+                inspections.recordReport(e.inspectionId(), NotificationStatus.SENT, null);
             }
             return;
         }
         Report report = store(e.orderItemId(), Report.Type.TECHNICAL_REPORT, pdf.technicalReport(e));
         log.info("Informe {} generado para el item {}", report.getReportId(), e.orderItemId());
+        inspections.recordReport(e.inspectionId(), NotificationStatus.PENDING, null);
         announce(report, e);
     }
 
     /** Etapa 3 (cola mail.report): envia el PDF por correo. Idempotente por informe. */
     public void mailReport(ReportGenerated e) {
-        Report report = reports.findById(e.reportId())
-                .orElseThrow(() -> new NotFoundException("Informe no encontrado: " + e.reportId()));
+        Report report = reports.findById(e.reportId()).orElseThrow(() ->
+                // Un informe que no existe no aparece por reintentar: directo a la cola de errores.
+                new AmqpRejectAndDontRequeueException("Informe no encontrado: " + e.reportId()));
         if (report.getEmailedAt() != null) {
             log.info("Informe {} ya enviado, se ignora la reentrega", report.getReportId());
             return;
@@ -99,19 +110,24 @@ public class ReportService {
         byte[] bytes;
         try {
             bytes = Files.readAllBytes(Path.of(report.getPdfUrl()));
+        } catch (NoSuchFileException ex) {
+            throw new AmqpRejectAndDontRequeueException("El archivo PDF ya no existe: " + report.getPdfUrl(), ex);
         } catch (IOException ex) {
             throw new UncheckedIOException("No se pudo leer el PDF " + report.getPdfUrl(), ex);
         }
         boolean approved = e.inspectionStatus() == InspectionStatus.PASSED;
-        boolean sent = mail.sendPdf(List.of(nullToEmpty(e.buyerEmail())),
+        MailResult result = mail.sendPdf(List.of(nullToEmpty(e.buyerEmail())),
                 "Informe técnico: " + (approved ? "producto aprobado" : "producto rechazado"),
                 "Hola,\n\nAdjuntamos el informe técnico de la revisión de \"" + e.description() + "\" (orden "
                         + e.orderId() + ").\nResultado: " + (approved ? "APROBADO, se enviará a tu dirección."
                         : "RECHAZADO, no se enviará.") + "\n\nPC Market Builder",
                 "informe-tecnico-" + e.orderItemId() + ".pdf", bytes);
-        if (sent) {
+        if (result.sent()) {
             report.setEmailedAt(Instant.now());
             reports.save(report);
+            inspections.recordReport(e.inspectionId(), NotificationStatus.SENT, null);
+        } else {
+            inspections.recordReport(e.inspectionId(), NotificationStatus.NOT_SENT, result.reason());
         }
     }
 

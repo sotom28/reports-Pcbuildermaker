@@ -15,6 +15,7 @@ import com.example.reports_service.messaging.Events.PaidItem;
 import com.example.reports_service.messaging.OutboundMessage;
 import com.example.reports_service.model.Inspection;
 import com.example.reports_service.model.InspectionStatus;
+import com.example.reports_service.model.NotificationStatus;
 import com.example.reports_service.repository.InspectionRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -27,6 +28,7 @@ import java.time.LocalDate;
 import java.time.ZoneId;
 import java.util.EnumSet;
 import java.util.List;
+import java.util.Set;
 
 /** El admin del taller revisa cada pieza pagada ANTES de enviarla; de esa revision sale el informe. */
 @Slf4j
@@ -36,6 +38,8 @@ import java.util.List;
 public class InspectionService {
 
     private static final ZoneId WORKSHOP_ZONE = ZoneId.of("America/Santiago");
+    /** Un correo que lleva mas que esto en PENDING se considera atascado (mensaje perdido o consumidor caido). */
+    private static final java.time.Duration STUCK_AFTER = java.time.Duration.ofMinutes(2);
 
     private final InspectionRepository inspections;
     private final ApplicationEventPublisher events;
@@ -64,7 +68,7 @@ public class InspectionService {
     public List<InspectionResponse> listOpen(AuthContext auth) {
         auth.requireAgent();
         return inspections.findByStatusInOrderByCreatedAtAsc(EnumSet.of(InspectionStatus.PENDING, InspectionStatus.IN_REVIEW))
-                .stream().map(InspectionResponse::from).toList();
+                .stream().filter(i -> i.getCancelledAt() == null).map(InspectionResponse::from).toList();
     }
 
     @Transactional(readOnly = true)
@@ -92,7 +96,7 @@ public class InspectionService {
     @Transactional(readOnly = true)
     public List<InspectionResponse> listToDeliver(AuthContext auth) {
         auth.requireAgent();
-        return inspections.findByStatusAndDeliveredAtIsNullOrderByCompletedAtAsc(InspectionStatus.PASSED)
+        return inspections.findByStatusAndDeliveredAtIsNullAndCancelledAtIsNullOrderByCompletedAtAsc(InspectionStatus.PASSED)
                 .stream().map(InspectionResponse::from).toList();
     }
 
@@ -103,6 +107,9 @@ public class InspectionService {
     public InspectionResponse deliver(AuthContext auth, String id) {
         auth.requireAgent();
         Inspection i = load(id);
+        if (i.getCancelledAt() != null) {
+            throw new ConflictException("La compra fue cancelada: no se puede entregar");
+        }
         if (i.getStatus() != InspectionStatus.PASSED) {
             throw new ConflictException("Solo se puede entregar una pieza aprobada (estado " + i.getStatus() + ")");
         }
@@ -133,8 +140,8 @@ public class InspectionService {
     public InspectionResponse claim(AuthContext auth, String id) {
         auth.requireAgent();
         Inspection i = load(id);
-        if (i.getStatus() != InspectionStatus.PENDING) {
-            throw new ConflictException("La inspeccion no esta pendiente (estado " + i.getStatus() + ")");
+        if (i.getCancelledAt() != null || i.getStatus() != InspectionStatus.PENDING) {
+            throw new ConflictException("La inspeccion no esta pendiente (estado " + i.visibleStatus() + ")");
         }
         i.setStatus(InspectionStatus.IN_REVIEW);
         i.setAgentId(auth.userId());
@@ -148,8 +155,8 @@ public class InspectionService {
             throw new IllegalArgumentException("El resultado debe ser PASSED o FAILED");
         }
         Inspection i = load(id);
-        if (!i.getStatus().isOpen()) {
-            throw new ConflictException("La inspeccion ya fue cerrada (" + i.getStatus() + ")");
+        if (i.getCancelledAt() != null || !i.getStatus().isOpen()) {
+            throw new ConflictException("La inspeccion ya fue cerrada (" + i.visibleStatus() + ")");
         }
         if (i.getStatus() == InspectionStatus.IN_REVIEW && !auth.userId().equals(i.getAgentId())) {
             throw new ConflictException("La inspeccion la tiene otro agente");
@@ -164,24 +171,142 @@ public class InspectionService {
         i.getChecks().clear();
         List<CheckRequest> checks = request.checks() == null ? List.of() : request.checks();
         checks.forEach(c -> i.getChecks().add(new Inspection.CheckEntry(c.component(), c.result(), c.note())));
+        i.setConfirmationStatus(NotificationStatus.PENDING);
+        i.setConfirmationError(null);
+        i.setReportStatus(NotificationStatus.PENDING);
+        i.setReportError(null);
 
-        events.publishEvent(new OutboundMessage(RabbitConfig.EXCHANGE, RabbitConfig.KEY_COMPLETED,
-                new InspectionCompleted(RabbitConfig.KEY_COMPLETED, now, i.getId(), i.getOrderId(), i.getOrderItemId(),
-                        i.getPublicationId(), i.getDescription(), i.getSellerId(), i.getBuyerId(), i.getBuyerEmail(),
-                        i.getStatus(), i.getMaintenanceDone(), i.getMaintenanceDate(), i.getWorkshopNotes(),
-                        i.getAgentId(),
-                        checks.stream().map(c -> new ComponentCheck(c.component(), c.result(), c.note())).toList())));
+        events.publishEvent(completedMessage(i, now));
         return InspectionResponse.from(i);
     }
 
-    /** Marca el correo de confirmacion como enviado (evita duplicarlo si RabbitMQ reentrega el mensaje). */
-    public void markConfirmationEmailed(String inspectionId) {
-        load(inspectionId).setConfirmationEmailedAt(Instant.now());
+    /**
+     * El taller cancela la compra (p. ej. no se puede avisar al comprador): la pieza deja de estar en la bandeja, en
+     * "Por entregar" y en "Correos". El BFF reembolsa la orden y devuelve la publicacion al catalogo. Idempotente.
+     * No aplica a una pieza ya rechazada (ya se reembolso) ni a una ya entregada.
+     */
+    public InspectionResponse cancel(AuthContext auth, String id) {
+        auth.requireAgent();
+        Inspection i = load(id);
+        if (i.getCancelledAt() != null) {
+            return InspectionResponse.from(i);
+        }
+        if (i.getStatus() == InspectionStatus.FAILED) {
+            throw new ConflictException("La pieza ya fue rechazada y su compra reembolsada: no hay nada que cancelar");
+        }
+        if (i.getDeliveredAt() != null) {
+            throw new ConflictException("La pieza ya fue entregada: no se puede cancelar la compra");
+        }
+        Instant now = Instant.now().truncatedTo(java.time.temporal.ChronoUnit.MILLIS);
+        i.setCancelledAt(now);
+        if (i.getCompletedAt() == null) {
+            i.setCompletedAt(now);
+        }
+        i.setAgentId(auth.userId());
+        return InspectionResponse.from(i);
+    }
+
+    /** Correo de confirmacion enviado (evita duplicarlo si RabbitMQ reentrega el mensaje). */
+    public void markConfirmationSent(String inspectionId) {
+        Inspection i = load(inspectionId);
+        i.setConfirmationEmailedAt(Instant.now());
+        i.setConfirmationStatus(NotificationStatus.SENT);
+        i.setConfirmationError(null);
     }
 
     @Transactional(readOnly = true)
     public boolean isConfirmationEmailed(String inspectionId) {
         return load(inspectionId).getConfirmationEmailedAt() != null;
+    }
+
+    /** Deja constancia del estado del correo de confirmacion (no enviado, fallido...) en vez de perderlo en un log. */
+    public void recordConfirmation(String inspectionId, NotificationStatus status, String error) {
+        inspections.findById(inspectionId).ifPresent(i -> {
+            i.setConfirmationStatus(status);
+            i.setConfirmationError(truncate(error));
+        });
+    }
+
+    /** Ídem para el informe (generar el PDF y enviarlo). */
+    public void recordReport(String inspectionId, NotificationStatus status, String error) {
+        inspections.findById(inspectionId).ifPresent(i -> {
+            i.setReportStatus(status);
+            i.setReportError(truncate(error));
+        });
+    }
+
+    /**
+     * Inspecciones cerradas cuyos correos necesitan atencion (pestana "Correos" del admin): alguno no se envio o fallo, o
+     * lleva demasiado en pendiente. Las anteriores al seguimiento (sin estado) no se consideran.
+     */
+    @Transactional(readOnly = true)
+    public List<InspectionResponse> listNotificationProblems(AuthContext auth) {
+        auth.requireAgent();
+        Instant stuckBefore = Instant.now().minus(STUCK_AFTER);
+        return inspections.findByStatusInOrderByCompletedAtDesc(Set.of(InspectionStatus.PASSED, InspectionStatus.FAILED))
+                .stream()
+                .filter(i -> i.getCancelledAt() == null)
+                .filter(i -> needsAttention(i.getConfirmationStatus(), i.getCompletedAt(), stuckBefore)
+                        || needsAttention(i.getReportStatus(), i.getCompletedAt(), stuckBefore))
+                .map(InspectionResponse::from)
+                .toList();
+    }
+
+    /**
+     * El admin pide reenviar los correos de una inspeccion cerrada. Vuelve a publicar inspection.completed: los consumidores
+     * son idempotentes, asi que lo que ya se envio no se repite y solo se rehace lo pendiente o fallido.
+     */
+    public InspectionResponse resendNotifications(AuthContext auth, String id) {
+        auth.requireAgent();
+        Inspection i = load(id);
+        if (i.getCancelledAt() != null) {
+            throw new ConflictException("La compra fue cancelada: no hay correos que reenviar");
+        }
+        if (i.getStatus().isOpen()) {
+            throw new ConflictException("La inspeccion aun no esta cerrada: no hay correos que reenviar");
+        }
+        boolean confirmationDone = i.getConfirmationEmailedAt() != null;
+        boolean reportDone = i.getReportStatus() == NotificationStatus.SENT;
+        if (confirmationDone && reportDone) {
+            return InspectionResponse.from(i); // nada pendiente
+        }
+        if (!confirmationDone) {
+            i.setConfirmationStatus(NotificationStatus.PENDING);
+            i.setConfirmationError(null);
+        }
+        if (!reportDone) {
+            i.setReportStatus(NotificationStatus.PENDING);
+            i.setReportError(null);
+        }
+        events.publishEvent(completedMessage(i, Instant.now()));
+        return InspectionResponse.from(i);
+    }
+
+    private static boolean needsAttention(NotificationStatus status, Instant completedAt, Instant stuckBefore) {
+        if (status == null || status == NotificationStatus.SENT) {
+            return false;
+        }
+        if (status == NotificationStatus.PENDING) {
+            return completedAt != null && completedAt.isBefore(stuckBefore);
+        }
+        return true; // NOT_SENT o FAILED
+    }
+
+    private static String truncate(String text) {
+        if (text == null) {
+            return null;
+        }
+        return text.length() <= 500 ? text : text.substring(0, 497) + "...";
+    }
+
+    private OutboundMessage completedMessage(Inspection i, Instant at) {
+        List<ComponentCheck> checks = i.getChecks().stream()
+                .map(c -> new ComponentCheck(c.getComponent(), c.getResult(), c.getNote())).toList();
+        return new OutboundMessage(RabbitConfig.EXCHANGE, RabbitConfig.KEY_COMPLETED,
+                new InspectionCompleted(RabbitConfig.KEY_COMPLETED, at, i.getId(), i.getOrderId(), i.getOrderItemId(),
+                        i.getPublicationId(), i.getDescription(), i.getSellerId(), i.getBuyerId(), i.getBuyerEmail(),
+                        i.getStatus(), i.getMaintenanceDone(), i.getMaintenanceDate(), i.getWorkshopNotes(),
+                        i.getAgentId(), checks));
     }
 
     private Inspection load(String id) {

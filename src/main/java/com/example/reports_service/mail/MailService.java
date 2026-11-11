@@ -34,23 +34,29 @@ public class MailService {
     }
 
     /** Correo de texto plano, sin adjunto. */
-    public boolean send(List<String> to, String subject, String body) {
+    public MailResult send(List<String> to, String subject, String body) {
         return send(to, subject, body, null, null);
     }
 
     /** Correo con el PDF adjunto. */
-    public boolean sendPdf(List<String> to, String subject, String body, String filename, byte[] pdf) {
+    public MailResult sendPdf(List<String> to, String subject, String body, String filename, byte[] pdf) {
         return send(to, subject, body, filename, pdf);
     }
 
-    /** @return true si se envio; false si no hay SMTP o no hay destinatarios. Lanza si el SMTP falla (reintenta el listener). */
-    private boolean send(List<String> to, String subject, String body, String filename, byte[] pdf) {
+    /**
+     * Devuelve ok si se envio, o notSent con el motivo si no hay destinatarios o SMTP (no se arregla reintentando: el
+     * llamador lo registra en vez de descartarlo). Si el SMTP falla de verdad lanza una excepcion y el listener reintenta.
+     */
+    private MailResult send(List<String> to, String subject, String body, String filename, byte[] pdf) {
         List<String> recipients = to.stream().filter(a -> a != null && !a.isBlank()).distinct().toList();
         JavaMailSender mailSender = smtpConfigured ? sender.getIfAvailable() : null;
-        if (recipients.isEmpty() || mailSender == null) {
-            log.warn("Correo '{}' no enviado (destinatarios={}, smtp configurado={})", subject, recipients,
-                    mailSender != null);
-            return false;
+        if (recipients.isEmpty()) {
+            log.warn("Correo '{}' no enviado: el comprador no tiene correo", subject);
+            return MailResult.notSent("El comprador no tiene correo registrado");
+        }
+        if (mailSender == null) {
+            log.warn("Correo '{}' no enviado: SMTP sin configurar", subject);
+            return MailResult.notSent("El servidor de correo (SMTP) no esta configurado");
         }
         try {
             MimeMessage message = mailSender.createMimeMessage();
@@ -64,7 +70,7 @@ public class MailService {
             }
             mailSender.send(message);
             log.info("Correo '{}' enviado a {}", subject, recipients);
-            return true;
+            return MailResult.ok();
         } catch (MessagingException e) {
             throw new IllegalStateException("No se pudo armar el correo", e);
         }

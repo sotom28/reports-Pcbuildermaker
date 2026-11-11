@@ -26,7 +26,8 @@ public class InspectionController {
 
     /**
      * ?scope=open (default, admin): pendientes de revision, las mas antiguas primero. mine (admin): las que cerro.
-     * to-deliver (admin): aprobadas sin entregar. buyer: mis compras. seller: mis ventas (formato reducido).
+     * to-deliver (admin): aprobadas sin entregar. notifications (admin): cerradas con correos pendientes, no enviados o
+     * fallidos. buyer: mis compras. seller: mis ventas (formato reducido).
      */
     @GetMapping
     public List<?> list(
@@ -38,10 +39,11 @@ public class InspectionController {
             case "open" -> inspections.listOpen(auth);
             case "mine" -> inspections.listMine(auth);
             case "to-deliver" -> inspections.listToDeliver(auth);
+            case "notifications" -> inspections.listNotificationProblems(auth);
             case "buyer" -> inspections.listAsBuyer(auth);
             case "seller" -> inspections.listAsSeller(auth);
             default -> throw new IllegalArgumentException(
-                    "El parametro 'scope' debe ser 'open', 'mine', 'to-deliver', 'buyer' o 'seller'");
+                    "El parametro 'scope' debe ser 'open', 'mine', 'to-deliver', 'notifications', 'buyer' o 'seller'");
         };
     }
 
@@ -67,6 +69,24 @@ public class InspectionController {
             @RequestHeader(value = AuthContext.ROLE_HEADER, required = false) String role,
             @PathVariable String id) {
         return inspections.deliver(new AuthContext(userId, role), id);
+    }
+
+    /** Cancela la compra de una pieza (el BFF reembolsa y la devuelve al catalogo). Solo el admin; idempotente. */
+    @PostMapping("/{id}/cancel")
+    public InspectionResponse cancel(
+            @RequestHeader(value = AuthContext.USER_ID_HEADER, required = false) String userId,
+            @RequestHeader(value = AuthContext.ROLE_HEADER, required = false) String role,
+            @PathVariable String id) {
+        return inspections.cancel(new AuthContext(userId, role), id);
+    }
+
+    /** Reenvia los correos pendientes o fallidos de una inspeccion cerrada (lo ya enviado no se repite). */
+    @PostMapping("/{id}/resend-notifications")
+    public InspectionResponse resendNotifications(
+            @RequestHeader(value = AuthContext.USER_ID_HEADER, required = false) String userId,
+            @RequestHeader(value = AuthContext.ROLE_HEADER, required = false) String role,
+            @PathVariable String id) {
+        return inspections.resendNotifications(new AuthContext(userId, role), id);
     }
 
     @PostMapping("/{id}/complete")
