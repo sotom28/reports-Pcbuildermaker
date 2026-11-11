@@ -75,13 +75,45 @@ public class Inspection {
     /** Cuando se envio el correo de confirmacion (null = aun no). Evita duplicarlo si RabbitMQ reentrega. */
     private Instant confirmationEmailedAt;
 
+    /**
+     * Estado del correo de confirmacion. null = inspeccion anterior a este seguimiento (solo se conoce
+     * confirmationEmailedAt). Las nuevas quedan en PENDING al cerrarse.
+     */
+    @Enumerated(EnumType.STRING)
+    @Column(length = 12)
+    private NotificationStatus confirmationStatus;
+
+    /** Motivo del ultimo fallo o de que no se enviara el correo de confirmacion. */
+    @Column(length = 500)
+    private String confirmationError;
+
+    /** Estado del informe: generar el PDF y enviarlo por correo. null = inspeccion anterior a este seguimiento. */
+    @Enumerated(EnumType.STRING)
+    @Column(length = 12)
+    private NotificationStatus reportStatus;
+
+    /** Motivo del ultimo fallo o de que no se enviara el informe. */
+    @Column(length = 500)
+    private String reportError;
+
     private Instant completedAt;
 
     /** Cuando el taller marco la pieza como entregada al comprador (null = aun no; solo tiene sentido si PASSED). */
     private Instant deliveredAt;
 
+    /**
+     * Cuando el taller cancelo la compra (null = no cancelada). Se guarda aparte y NO como un valor mas de `status`: esa
+     * columna es un ENUM de MariaDB creado por Hibernate y agregar un valor exigiria alterar la tabla en cada base.
+     */
+    private Instant cancelledAt;
+
     @Column(nullable = false, updatable = false)
     private Instant createdAt = Instant.now();
+
+    /** Estado que ve el resto del sistema: CANCELLED si el taller cancelo la compra, si no el guardado en `status`. */
+    public InspectionStatus visibleStatus() {
+        return cancelledAt != null ? InspectionStatus.CANCELLED : status;
+    }
 
     @Embeddable
     @Getter
@@ -104,4 +136,5 @@ public class Inspection {
             this.note = note;
         }
     }
+
 }

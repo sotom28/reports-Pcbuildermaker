@@ -6,6 +6,7 @@ import com.example.reports_service.dto.InspectionDtos.CheckRequest;
 import com.example.reports_service.dto.InspectionDtos.CompleteRequest;
 import com.example.reports_service.exception.ApiExceptions.ConflictException;
 import com.example.reports_service.exception.ApiExceptions.ForbiddenException;
+import com.example.reports_service.mail.MailResult;
 import com.example.reports_service.mail.MailService;
 import com.example.reports_service.messaging.Events.ComponentResult;
 import com.example.reports_service.messaging.Events.InspectionCompleted;
@@ -13,17 +14,25 @@ import com.example.reports_service.messaging.Events.OrderPaid;
 import com.example.reports_service.messaging.Events.PaidItem;
 import com.example.reports_service.messaging.Events.ReportGenerated;
 import com.example.reports_service.model.InspectionStatus;
+import com.example.reports_service.model.NotificationStatus;
 import com.example.reports_service.model.Report;
 import com.example.reports_service.service.InspectionService;
 import com.example.reports_service.service.ReportService;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.springframework.amqp.AmqpRejectAndDontRequeueException;
+import org.springframework.amqp.core.Message;
+import org.springframework.amqp.core.MessageProperties;
+import org.springframework.amqp.rabbit.retry.MessageRecoverer;
+import org.springframework.boot.amqp.autoconfigure.RabbitListenerRetrySettingsCustomizer;
+import org.springframework.boot.retry.RetryPolicySettings;
 import org.springframework.amqp.rabbit.connection.CorrelationData;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
@@ -112,7 +121,7 @@ class InspectionFlowTest {
         assertEquals(2, completed.checks().size());
 
         // cola mail.confirmation: un correo sin adjunto, y la reentrega no lo duplica
-        when(mail.send(anyList(), anyString(), anyString())).thenReturn(true);
+        when(mail.send(anyList(), anyString(), anyString())).thenReturn(MailResult.ok());
         reports.sendConfirmation(completed);
         reports.sendConfirmation(completed);
         verify(mail, times(1)).send(eq(List.of("comprador@correo.cl")), anyString(), anyString());
@@ -126,7 +135,7 @@ class InspectionFlowTest {
         assertEquals(report.getReportId(), generated.reportId());
 
         // cola mail.report: envia el PDF adjunto, y la reentrega no lo duplica
-        when(mail.sendPdf(anyList(), anyString(), anyString(), anyString(), any(byte[].class))).thenReturn(true);
+        when(mail.sendPdf(anyList(), anyString(), anyString(), anyString(), any(byte[].class))).thenReturn(MailResult.ok());
         reports.mailReport(generated);
         reports.mailReport(generated);
         var attachment = ArgumentCaptor.forClass(byte[].class);
@@ -155,7 +164,7 @@ class InspectionFlowTest {
         ReportGenerated generated = new ReportGenerated(RabbitConfig.KEY_REPORT_GENERATED, Instant.now(),
                 reports.latestTechnicalReport("item-3").getReportId(), completed.inspectionId(), completed.orderId(),
                 completed.orderItemId(), completed.description(), completed.buyerEmail(), completed.inspectionStatus());
-        when(mail.sendPdf(anyList(), anyString(), anyString(), anyString(), any(byte[].class))).thenReturn(true);
+        when(mail.sendPdf(anyList(), anyString(), anyString(), anyString(), any(byte[].class))).thenReturn(MailResult.ok());
         reports.mailReport(generated);
         reports.generate(completed);
         verify(rabbit, times(2)).convertAndSend(eq(RabbitConfig.EXCHANGE), eq(RabbitConfig.KEY_REPORT_GENERATED),
@@ -183,11 +192,16 @@ class InspectionFlowTest {
         service.complete(ADMIN, id, form(InspectionStatus.PASSED));
         InspectionCompleted completed = published(RabbitConfig.KEY_COMPLETED, InspectionCompleted.class);
 
-        when(mail.send(anyList(), anyString(), anyString())).thenReturn(false); // SMTP sin configurar
+        when(mail.send(anyList(), anyString(), anyString()))
+                .thenReturn(MailResult.notSent("El servidor de correo (SMTP) no esta configurado"));
         reports.sendConfirmation(completed);
         reports.sendConfirmation(completed);
         verify(mail, times(2)).send(anyList(), anyString(), anyString()); // se vuelve a intentar
         assertFalse(service.isConfirmationEmailed(id));
+        // ya no se descarta en silencio: queda el estado y el motivo
+        var confirmation = service.get(ADMIN, id).notifications().confirmation();
+        assertEquals(NotificationStatus.NOT_SENT, confirmation.status());
+        assertTrue(confirmation.error().contains("SMTP"));
     }
 
     @Test
@@ -258,5 +272,218 @@ class InspectionFlowTest {
     @Test
     void soloElAdminOperaLaBandeja() {
         assertThrows(ForbiddenException.class, () -> service.listOpen(BUYER));
+    }
+
+    // ---------- manejo de errores de correo y PDF ----------
+
+    /** Cierra una inspeccion y devuelve el evento que reports publico (el que consumen las colas). */
+    InspectionCompleted closed(String n) {
+        service.registerPaidOrder(order(n));
+        service.complete(ADMIN, openId(n), form(InspectionStatus.PASSED));
+        return published(RabbitConfig.KEY_COMPLETED, InspectionCompleted.class);
+    }
+
+    @Test
+    void unCorreoNoEnviadoQuedaRegistradoApareceEnCorreosYSePuedeReenviar() {
+        InspectionCompleted completed = closed("21");
+        String id = completed.inspectionId();
+        assertEquals(NotificationStatus.PENDING, service.get(ADMIN, id).notifications().confirmation().status());
+
+        when(mail.send(anyList(), anyString(), anyString())).thenReturn(MailResult.notSent("Sin SMTP"));
+        reports.sendConfirmation(completed);
+        assertTrue(service.listNotificationProblems(ADMIN).stream().anyMatch(i -> i.id().equals(id)),
+                "una inspeccion con correo no enviado debe aparecer en la pestana de correos");
+
+        // el admin reenvia: vuelve a PENDING y se republica inspection.completed
+        var resent = service.resendNotifications(ADMIN, id);
+        assertEquals(NotificationStatus.PENDING, resent.notifications().confirmation().status());
+        assertEquals(null, resent.notifications().confirmation().error());
+        verify(rabbit, times(2)).convertAndSend(eq(RabbitConfig.EXCHANGE), eq(RabbitConfig.KEY_COMPLETED),
+                any(Object.class), any(CorrelationData.class));
+
+        // SMTP arreglado: el consumidor lo envia y deja de aparecer como problema
+        when(mail.send(anyList(), anyString(), anyString())).thenReturn(MailResult.ok());
+        reports.sendConfirmation(completed);
+        assertEquals(NotificationStatus.SENT, service.get(ADMIN, id).notifications().confirmation().status());
+        assertTrue(service.listNotificationProblems(ADMIN).stream().noneMatch(i -> i.id().equals(id)));
+    }
+
+    @Test
+    void elReenvioNoRepiteLoQueYaSeEnvio() throws Exception {
+        InspectionCompleted completed = closed("22");
+        String id = completed.inspectionId();
+        when(mail.send(anyList(), anyString(), anyString())).thenReturn(MailResult.ok());
+        when(mail.sendPdf(anyList(), anyString(), anyString(), anyString(), any(byte[].class))).thenReturn(MailResult.ok());
+        reports.sendConfirmation(completed);
+        reports.generate(completed);
+        reports.mailReport(published(RabbitConfig.KEY_REPORT_GENERATED, ReportGenerated.class));
+        var notifications = service.get(ADMIN, id).notifications();
+        assertEquals(NotificationStatus.SENT, notifications.confirmation().status());
+        assertEquals(NotificationStatus.SENT, notifications.report().status());
+
+        service.resendNotifications(ADMIN, id); // nada pendiente: no republica
+        verify(rabbit, times(1)).convertAndSend(eq(RabbitConfig.EXCHANGE), eq(RabbitConfig.KEY_COMPLETED),
+                any(Object.class), any(CorrelationData.class));
+    }
+
+    @Test
+    void soloSePuedeReenviarUnaInspeccionCerradaYSoloElAdmin() {
+        service.registerPaidOrder(order("23"));
+        String openId = openId("23");
+        assertThrows(ConflictException.class, () -> service.resendNotifications(ADMIN, openId));
+        assertThrows(ForbiddenException.class, () -> service.resendNotifications(BUYER, openId));
+        assertThrows(ForbiddenException.class, () -> service.listNotificationProblems(BUYER));
+    }
+
+    @Test
+    void siElInformeNoSePuedeEnviarQuedaNoEnviadoYSinMarcaDeEnvio() {
+        InspectionCompleted completed = closed("24");
+        reports.generate(completed);
+        ReportGenerated generated = published(RabbitConfig.KEY_REPORT_GENERATED, ReportGenerated.class);
+        when(mail.sendPdf(anyList(), anyString(), anyString(), anyString(), any(byte[].class)))
+                .thenReturn(MailResult.notSent("El comprador no tiene correo registrado"));
+        reports.mailReport(generated);
+
+        var report = service.get(ADMIN, completed.inspectionId()).notifications().report();
+        assertEquals(NotificationStatus.NOT_SENT, report.status());
+        assertEquals("El comprador no tiene correo registrado", report.error());
+        assertEquals(null, reports.latestTechnicalReport("item-24").getEmailedAt());
+    }
+
+    @Test
+    void unInformeInexistenteEsUnErrorPermanenteQueNoSeReintenta() {
+        var missing = new ReportGenerated(RabbitConfig.KEY_REPORT_GENERATED, Instant.now(), "no-existe", "i", "o",
+                "item-x", "RTX", "comprador@correo.cl", InspectionStatus.PASSED);
+        assertThrows(AmqpRejectAndDontRequeueException.class, () -> reports.mailReport(missing));
+    }
+
+    @Autowired
+    RabbitListenerRetrySettingsCustomizer retryCustomizer;
+
+    @Autowired
+    MessageRecoverer failureRecorder;
+
+    @Test
+    void losErroresPermanentesNoSeReintentanPeroLosDemasSi() {
+        var settings = new RetryPolicySettings();
+        retryCustomizer.customize(settings);
+        var wrapped = new org.springframework.amqp.rabbit.support.ListenerExecutionFailedException("x",
+                new AmqpRejectAndDontRequeueException("permanente"), new Message(new byte[0]));
+        assertFalse(settings.getExceptionPredicate().test(wrapped), "permanente (aun envuelto): no se reintenta");
+        assertTrue(settings.getExceptionPredicate().test(new IllegalStateException("smtp caido")));
+    }
+
+    @Test
+    void alAgotarLosIntentosSeRegistraElFalloYElMensajeVaALaColaDeErrores() {
+        InspectionCompleted completed = closed("25");
+        String id = completed.inspectionId();
+
+        Message confirmation = failedMessage("mail.confirmation", id);
+        assertThrows(Exception.class, () -> failureRecorder.recover(confirmation, new RuntimeException("smtp caido")));
+        var afterConfirmation = service.get(ADMIN, id).notifications();
+        assertEquals(NotificationStatus.FAILED, afterConfirmation.confirmation().status());
+        assertTrue(afterConfirmation.confirmation().error().contains("Error inesperado"));
+
+        Message report = failedMessage("report.generate", id);
+        assertThrows(Exception.class, () -> failureRecorder.recover(report, new IllegalStateException("pdf roto")));
+        assertEquals(NotificationStatus.FAILED, service.get(ADMIN, id).notifications().report().status());
+
+        // un mensaje ilegible o de otra cola no impide mandarlo a la cola de errores
+        assertThrows(Exception.class, () -> failureRecorder.recover(failedMessage("reports.new-order", "x"),
+                new RuntimeException("boom")));
+        assertTrue(service.listNotificationProblems(ADMIN).stream().anyMatch(i -> i.id().equals(id)));
+    }
+
+    Message failedMessage(String queue, String inspectionId) {
+        var props = new MessageProperties();
+        props.setConsumerQueue(queue);
+        return new Message(("{\"inspectionId\":\"" + inspectionId + "\"}").getBytes(StandardCharsets.UTF_8), props);
+    }
+
+    @Test
+    void losFallosSeExplicanEnEspanolSegunSuCausa() {
+        record Caso(Throwable causa, String esperado) { }
+        var casos = List.of(
+                new Caso(new org.springframework.mail.MailSendException("fallo",
+                        new java.net.ConnectException("Connection refused")), "no responde"),
+                new Caso(new java.net.SocketTimeoutException("timeout"), "no responde"),
+                new Caso(new org.springframework.mail.MailAuthenticationException("535 Authentication failed"),
+                        "rechazó las credenciales"),
+                new Caso(new IllegalStateException("No se pudo generar el PDF"), "informe PDF"));
+        for (Caso caso : casos) {
+            org.mockito.Mockito.clearInvocations(rabbit); // closed() verifica una sola publicacion por inspeccion
+            InspectionCompleted completed = closed("3" + casos.indexOf(caso));
+            Message message = failedMessage("mail.confirmation", completed.inspectionId());
+            assertThrows(Exception.class, () -> failureRecorder.recover(message, caso.causa()));
+            String error = service.get(ADMIN, completed.inspectionId()).notifications().confirmation().error();
+            assertTrue(error.contains(caso.esperado()), error);
+            assertFalse(error.contains("Connection refused"), "el detalle tecnico no va al admin: " + error);
+        }
+    }
+
+    // ---------- cancelar la compra ----------
+
+    @Test
+    void elAdminCancelaUnaPiezaAprobadaYSaleDeTodasLasListasDelTaller() {
+        InspectionCompleted completed = closed("41");
+        String id = completed.inspectionId();
+        when(mail.send(anyList(), anyString(), anyString())).thenReturn(MailResult.notSent("Sin SMTP"));
+        reports.sendConfirmation(completed);
+        assertTrue(service.listNotificationProblems(ADMIN).stream().anyMatch(i -> i.id().equals(id)));
+        assertTrue(service.listToDeliver(ADMIN).stream().anyMatch(i -> i.id().equals(id)));
+
+        var cancelled = service.cancel(ADMIN, id);
+        assertEquals(InspectionStatus.CANCELLED, cancelled.status());
+        assertNotNull(cancelled.completedAt());
+        assertTrue(service.listNotificationProblems(ADMIN).stream().noneMatch(i -> i.id().equals(id)));
+        assertTrue(service.listToDeliver(ADMIN).stream().noneMatch(i -> i.id().equals(id)));
+        assertEquals(InspectionStatus.CANCELLED, service.get(ADMIN, id).status());
+
+        // idempotente, y ya no se puede entregar, reenviar ni volver a revisar
+        assertEquals(InspectionStatus.CANCELLED, service.cancel(ADMIN, id).status());
+        assertThrows(ConflictException.class, () -> service.deliver(ADMIN, id));
+        assertThrows(ConflictException.class, () -> service.resendNotifications(ADMIN, id));
+        assertThrows(ConflictException.class, () -> service.complete(ADMIN, id, form(InspectionStatus.PASSED)));
+    }
+
+    @Test
+    void sePuedeCancelarUnaPiezaQueAunNoSeRevisoYSaleDeLaBandeja() {
+        service.registerPaidOrder(order("42"));
+        String id = openId("42");
+        assertEquals(InspectionStatus.CANCELLED, service.cancel(ADMIN, id).status());
+        assertTrue(service.listOpen(ADMIN).stream().noneMatch(i -> i.id().equals(id)));
+        assertThrows(ConflictException.class, () -> service.claim(ADMIN, id));
+        assertThrows(ConflictException.class, () -> service.complete(ADMIN, id, form(InspectionStatus.PASSED)));
+    }
+
+    @Test
+    void noSeCancelaUnaPiezaRechazadaNiEntregadaNiLoHaceQuienNoEsAdmin() {
+        InspectionCompleted rejected = closedAs("43", InspectionStatus.FAILED);
+        assertThrows(ConflictException.class, () -> service.cancel(ADMIN, rejected.inspectionId()));
+
+        InspectionCompleted delivered = closedAs("44", InspectionStatus.PASSED);
+        service.deliver(ADMIN, delivered.inspectionId());
+        assertThrows(ConflictException.class, () -> service.cancel(ADMIN, delivered.inspectionId()));
+
+        assertThrows(ForbiddenException.class, () -> service.cancel(BUYER, delivered.inspectionId()));
+    }
+
+    @Test
+    void elComprador_yElVendedorVenLaCompraCancelada() {
+        InspectionCompleted completed = closed("45");
+        service.cancel(ADMIN, completed.inspectionId());
+        var buyer = service.listAsBuyer(new AuthContext("buyer-1", null)).stream()
+                .filter(i -> i.id().equals(completed.inspectionId())).findFirst().orElseThrow();
+        assertEquals(InspectionStatus.CANCELLED, buyer.status());
+        var sale = service.listAsSeller(new AuthContext("seller-1", null)).stream()
+                .filter(i -> i.id().equals(completed.inspectionId())).findFirst().orElseThrow();
+        assertEquals(InspectionStatus.CANCELLED, sale.status());
+    }
+
+    InspectionCompleted closedAs(String n, InspectionStatus result) {
+        org.mockito.Mockito.clearInvocations(rabbit);
+        service.registerPaidOrder(order(n));
+        service.complete(ADMIN, openId(n), form(result));
+        return published(RabbitConfig.KEY_COMPLETED, InspectionCompleted.class);
     }
 }

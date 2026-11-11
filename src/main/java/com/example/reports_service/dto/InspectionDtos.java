@@ -3,6 +3,7 @@ package com.example.reports_service.dto;
 import com.example.reports_service.messaging.Events.ComponentResult;
 import com.example.reports_service.model.Inspection;
 import com.example.reports_service.model.InspectionStatus;
+import com.example.reports_service.model.NotificationStatus;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
@@ -38,6 +39,14 @@ public final class InspectionDtos {
     public record CheckResponse(String component, ComponentResult result, String note) {
     }
 
+    /** Estado de un correo y, si no salio, el motivo. status null = aun no se sabe (inspeccion abierta o anterior al seguimiento). */
+    public record NotificationInfo(NotificationStatus status, String error) {
+    }
+
+    /** confirmation: correo de "tu pieza paso la revision". report: generar el PDF y enviarlo. */
+    public record Notifications(NotificationInfo confirmation, NotificationInfo report) {
+    }
+
     public record InspectionResponse(
             String id,
             String orderId,
@@ -55,14 +64,20 @@ public final class InspectionDtos {
             List<CheckResponse> checks,
             Instant completedAt,
             Instant deliveredAt,
-            Instant createdAt) {
+            Instant createdAt,
+            Notifications notifications) {
 
         public static InspectionResponse from(Inspection i) {
+            NotificationStatus confirmation = i.getConfirmationStatus() != null ? i.getConfirmationStatus()
+                    : (i.getConfirmationEmailedAt() != null ? NotificationStatus.SENT : null);
+            Notifications notifications = new Notifications(
+                    new NotificationInfo(confirmation, i.getConfirmationError()),
+                    new NotificationInfo(i.getReportStatus(), i.getReportError()));
             return new InspectionResponse(i.getId(), i.getOrderId(), i.getOrderItemId(), i.getPublicationId(),
-                    i.getDescription(), i.getBuyerId(), i.getBuyerEmail(), i.getSellerId(), i.getStatus(),
+                    i.getDescription(), i.getBuyerId(), i.getBuyerEmail(), i.getSellerId(), i.visibleStatus(),
                     i.getAgentId(), i.getMaintenanceDone(), i.getMaintenanceDate(), i.getWorkshopNotes(),
                     i.getChecks().stream().map(c -> new CheckResponse(c.getComponent(), c.getResult(), c.getNote())).toList(),
-                    i.getCompletedAt(), i.getDeliveredAt(), i.getCreatedAt());
+                    i.getCompletedAt(), i.getDeliveredAt(), i.getCreatedAt(), notifications);
         }
     }
 
@@ -85,7 +100,7 @@ public final class InspectionDtos {
 
         public static SaleResponse from(Inspection i) {
             return new SaleResponse(i.getId(), i.getOrderId(), i.getOrderItemId(), i.getPublicationId(),
-                    i.getDescription(), i.getBuyerId(), i.getStatus(), i.getCompletedAt(), i.getDeliveredAt(),
+                    i.getDescription(), i.getBuyerId(), i.visibleStatus(), i.getCompletedAt(), i.getDeliveredAt(),
                     i.getCreatedAt());
         }
     }
