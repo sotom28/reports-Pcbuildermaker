@@ -107,6 +107,12 @@ public class Inspection {
      */
     private Instant cancelledAt;
 
+    /**
+     * Cuando el admin descarto el aviso de correos (p. ej. el comprador no tiene correo y reenviar no lo arregla): la inspeccion
+     * deja de aparecer en la pestana "Correos". Reenviar los correos de nuevo vuelve a ponerla en seguimiento.
+     */
+    private Instant notificationsDismissedAt;
+
     @Column(nullable = false, updatable = false)
     private Instant createdAt = Instant.now();
 

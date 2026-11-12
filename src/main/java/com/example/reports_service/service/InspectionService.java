@@ -245,7 +245,7 @@ public class InspectionService {
         Instant stuckBefore = Instant.now().minus(STUCK_AFTER);
         return inspections.findByStatusInOrderByCompletedAtDesc(Set.of(InspectionStatus.PASSED, InspectionStatus.FAILED))
                 .stream()
-                .filter(i -> i.getCancelledAt() == null)
+                .filter(i -> i.getCancelledAt() == null && i.getNotificationsDismissedAt() == null)
                 .filter(i -> needsAttention(i.getConfirmationStatus(), i.getCompletedAt(), stuckBefore)
                         || needsAttention(i.getReportStatus(), i.getCompletedAt(), stuckBefore))
                 .map(InspectionResponse::from)
@@ -270,6 +270,7 @@ public class InspectionService {
         if (confirmationDone && reportDone) {
             return InspectionResponse.from(i); // nada pendiente
         }
+        i.setNotificationsDismissedAt(null); // el admin vuelve a ocuparse de esto: vuelve a la lista si algo falla
         if (!confirmationDone) {
             i.setConfirmationStatus(NotificationStatus.PENDING);
             i.setConfirmationError(null);
@@ -279,6 +280,22 @@ public class InspectionService {
             i.setReportError(null);
         }
         events.publishEvent(completedMessage(i, Instant.now()));
+        return InspectionResponse.from(i);
+    }
+
+    /**
+     * El admin da por revisado el aviso de correos de una inspeccion cerrada y la saca de la pestana "Correos" sin reenviar nada
+     * (para lo que reenviar no arregla, como un comprador sin correo). No toca los estados: siguen visibles en el detalle. Idempotente.
+     */
+    public InspectionResponse dismissNotifications(AuthContext auth, String id) {
+        auth.requireAgent();
+        Inspection i = load(id);
+        if (i.getStatus().isOpen() && i.getCancelledAt() == null) {
+            throw new ConflictException("La inspeccion aun no esta cerrada: no hay avisos que descartar");
+        }
+        if (i.getNotificationsDismissedAt() == null) {
+            i.setNotificationsDismissedAt(Instant.now().truncatedTo(java.time.temporal.ChronoUnit.MILLIS));
+        }
         return InspectionResponse.from(i);
     }
 
