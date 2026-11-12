@@ -80,6 +80,15 @@ public class InspectionController {
         return inspections.cancel(new AuthContext(userId, role), id);
     }
 
+    /** Descarta el aviso de correos de una inspeccion cerrada (deja de aparecer en la pestana Correos). Solo el admin; idempotente. */
+    @PostMapping("/{id}/dismiss-notifications")
+    public InspectionResponse dismissNotifications(
+            @RequestHeader(value = AuthContext.USER_ID_HEADER, required = false) String userId,
+            @RequestHeader(value = AuthContext.ROLE_HEADER, required = false) String role,
+            @PathVariable String id) {
+        return inspections.dismissNotifications(new AuthContext(userId, role), id);
+    }
+
     /** Reenvia los correos pendientes o fallidos de una inspeccion cerrada (lo ya enviado no se repite). */
     @PostMapping("/{id}/resend-notifications")
     public InspectionResponse resendNotifications(

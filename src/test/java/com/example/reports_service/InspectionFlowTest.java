@@ -486,4 +486,38 @@ class InspectionFlowTest {
         service.complete(ADMIN, openId(n), form(result));
         return published(RabbitConfig.KEY_COMPLETED, InspectionCompleted.class);
     }
+
+    // ---------- descartar el aviso de correos ----------
+
+    @Test
+    void descartarElAvisoSacaLaInspeccionDeLaListaDeCorreosSinReenviarNada() {
+        InspectionCompleted completed = closedAs("51", InspectionStatus.PASSED);
+        String id = completed.inspectionId();
+        when(mail.send(anyList(), anyString(), anyString())).thenReturn(MailResult.notSent("El comprador no tiene correo registrado"));
+        reports.sendConfirmation(completed);
+        assertTrue(service.listNotificationProblems(ADMIN).stream().anyMatch(i -> i.id().equals(id)));
+        service.deliver(ADMIN, id); // entregada: ya no se puede cancelar, solo descartar el aviso
+        assertThrows(ConflictException.class, () -> service.cancel(ADMIN, id));
+
+        service.dismissNotifications(ADMIN, id);
+        assertTrue(service.listNotificationProblems(ADMIN).stream().noneMatch(i -> i.id().equals(id)));
+        // idempotente, no publica nada nuevo y deja los estados visibles
+        service.dismissNotifications(ADMIN, id);
+        verify(rabbit, times(1)).convertAndSend(eq(RabbitConfig.EXCHANGE), eq(RabbitConfig.KEY_COMPLETED), any(Object.class), any(CorrelationData.class));
+        assertEquals(NotificationStatus.NOT_SENT, service.get(ADMIN, id).notifications().confirmation().status());
+
+        // si despues el admin reenvia, vuelve al seguimiento
+        service.resendNotifications(ADMIN, id);
+        when(mail.send(anyList(), anyString(), anyString())).thenReturn(MailResult.notSent("Sin correo"));
+        reports.sendConfirmation(completed);
+        assertTrue(service.listNotificationProblems(ADMIN).stream().anyMatch(i -> i.id().equals(id)));
+    }
+
+    @Test
+    void soloSeDescartaElAvisoDeUnaInspeccionCerradaYSoloElAdmin() {
+        service.registerPaidOrder(order("52"));
+        String open = openId("52");
+        assertThrows(ConflictException.class, () -> service.dismissNotifications(ADMIN, open));
+        assertThrows(ForbiddenException.class, () -> service.dismissNotifications(BUYER, open));
+    }
 }
